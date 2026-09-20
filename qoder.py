@@ -406,6 +406,33 @@ async def stream_chat(
                     yield delta
 
 
+def merge_tool_calls(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把工具调用碎片拼回完整调用。
+
+    老版协议会把一次调用拆成好几片：id/函数名在第一片，arguments 被切成几段跟在后面
+    （且每片的 index 都是 0，所以不能按 index 合并，只能按到达顺序拼）。
+    """
+    merged: list[dict[str, Any]] = []
+    for fragment in fragments:
+        function = fragment.get("function") or {}
+        name = str(function.get("name") or "")
+        arguments = str(function.get("arguments") or "")
+        starts_new = bool(fragment.get("id")) and (not merged or name)
+        if not merged or starts_new:
+            merged.append(
+                {
+                    "id": str(fragment.get("id") or ""),
+                    "type": str(fragment.get("type") or "function"),
+                    "function": {"name": name, "arguments": arguments},
+                }
+            )
+            continue
+        if name and not merged[-1]["function"]["name"]:
+            merged[-1]["function"]["name"] = name
+        merged[-1]["function"]["arguments"] += arguments
+    return merged
+
+
 async def complete_chat(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
@@ -427,7 +454,7 @@ async def complete_chat(
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
-        message["tool_calls"] = tool_calls
+        message["tool_calls"] = merge_tool_calls(tool_calls)
     return message
 
 
