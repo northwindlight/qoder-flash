@@ -228,11 +228,21 @@ def _text_of(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _convert_message(message: dict[str, Any]) -> dict[str, Any] | None:
+def _convert_message(message: dict[str, Any], has_tools: bool = False) -> dict[str, Any] | None:
+    """OpenAI 消息 → 老版端点的消息。
+
+    ★ tool_calls 的两种走法（2026-09-20 修）：
+    - **带 tools 的请求**：`tool_calls` 与 `role:"tool"` **原样透传**。上游 body 里本来就是
+      `"messages": converted` + `"format": "openai"`，它认 OpenAI 结构；拍平成文本反而害了模型——
+      实测（zhanguo 看海）：拍平后模型在自己历史里看到
+      `Tool calls:\\n[{"id": "call_…", …}]`，于是**照抄这个格式**，把工具调用当正文写出来，
+      一条都不真发（客户端只看到"有正文没调用"⇒ 当宣告收尾，整回合空转）。
+    - **不带 tools 的请求**（纯文本回放）：才回灌成上下文文本——上游此时没有工具概念。
+    """
     role = str(message.get("role") or "user")
     text = _text_of(message.get("content"))
 
-    if role == "tool":  # 工具结果在无 tools 时当作上下文文本回灌
+    if role == "tool" and not has_tools:  # 无 tools 时工具结果当作上下文文本回灌
         label = "Tool result"
         if message.get("name"):
             label += f" ({message['name']})"
@@ -249,7 +259,23 @@ def _convert_message(message: dict[str, Any]) -> dict[str, Any] | None:
             "response_meta": _response_meta(),
             "reasoning_content_signature": "",
         }
+    if role == "tool":                    # 有 tools：原样透传（含 tool_call_id 配对）
+        out: dict[str, Any] = {"role": "tool", "content": text}
+        if message.get("tool_call_id"):
+            out["tool_call_id"] = message["tool_call_id"]
+        if message.get("name"):
+            out["name"] = message["name"]
+        return out
     if role == "assistant" and message.get("tool_calls"):
+        if has_tools:                     # 有 tools：**原样透传**，别拍成文本让模型学坏
+            out = {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": message["tool_calls"],
+                "response_meta": _response_meta(),
+                "reasoning_content_signature": "",
+            }
+            return out
         text = f"{text}\n\nTool calls:\n{json.dumps(message['tool_calls'], ensure_ascii=False)}".strip()
     if not text.strip():
         return None
@@ -268,7 +294,8 @@ def build_body(
     reasoning_effort: str = "none",
 ) -> dict[str, Any]:
     """拼出老版端点的请求体（字段名照服务端要求，不能随意增删）。"""
-    converted = [m for m in (_convert_message(m) for m in messages) if m]
+    has_tools = bool(tools)
+    converted = [m for m in (_convert_message(m, has_tools) for m in messages) if m]
     prompt = ""
     for message in reversed(converted):
         if message["role"] == "user":
