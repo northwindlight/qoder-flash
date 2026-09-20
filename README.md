@@ -1,23 +1,32 @@
-# Qoder Flash Gateway
+# Qoder Gateway
 
-把本机的 Qoder 登录态包成一个 OpenAI 兼容接口，固定只跑 **Qwen3.8-Flash**。
+把本机的 Qoder 登录态包成一个 OpenAI / DeepSeek 兼容接口，**可选模型**（Qwen / GLM / DeepSeek / Kimi …）。
 Windows / Linux 通用（纯 Python，无平台相关代码）。
+
+两个区都支持，用 `region` 配置切换：
+
+| region | 端点 | 凭据目录 | 账号能用的模型 |
+|---|---|---|---|
+| `cn` | `gateway.qoder.com.cn` | `~/.qoder-cn/.auth/` | 一整套（Qwen 3.7/3.8 全系、GLM、DeepSeek、Kimi…） |
+| `intl` | `api3.qoder.sh` | `~/.qoder/.auth/` | 免费号只有 `qwen3.8-flash` 可用（Max 会挂） |
 
 ## 它是怎么工作的
 
-1. 读 `qodercli login` 在 `~/.qoder/.auth/` 下写好的两个文件：`machine_id`（明文）和 `user`
-   （base64 的 AES-CBC 密文，密钥与 IV 都取 `machine_id` 前 16 字节）。**只读，不写、不改**，
-   所以不会动到 CLI 自己的登录态。
-2. 用这套凭据向 Qoder 的老版 SSE 端点发起请求：
-   `api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`
-   —— 鉴权是 COSY 签名头，包体要过一遍 Qoder 自定义 base64，模型名放在 `X-Model-Key: qfmodel`。
+1. 读 CLI 登录后写下的两个文件：`machine_id`（明文）和 `user`（base64 的 AES-CBC 密文，
+   密钥与 IV 都取 `machine_id` 前 16 字节）。**只读，不写、不改**，不会动到 CLI 自己的登录态。
+2. 用这套凭据打 Qoder 的老版 SSE 端点 `…/algo/api/v2/service/pro/sse/agent_chat_generation`：
+   鉴权是 COSY 签名头，包体要过一遍 Qoder 自定义 base64，**模型放在请求头 `X-Model-Key` 里**。
 3. 把回来的流翻译成 OpenAI 的 `chat.completion.chunk`。
 
-为什么走老版端点：免费账号的 **Qwen3.8-Flash 是无限量的**，而这条路是唯一能用到它的
-（新版 OpenAI 兼容端点对这类账号只放行 `lite`，其余模型一律 `402 quota exceeded`）。
-
-> 上面这套协议是怎么逆出来的、走过哪些死路、版本更新后怎么重来一遍 —— 见
+> 协议怎么逆出来的、走过哪些死路、版本更新后怎么重来 —— 见
 > [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)。
+
+### ⚠️ 两个必须知道的坑
+
+- **`model` 要传 key，不能传显示名。** 显示名（`GLM-5.3`）服务端不认，而且**不报错** ——
+  它会静默回落到 `auto`，你收到的就是另一个模型。key 见下表。
+- **回包里的 `model` 字段恒为 `"auto"`，不反映真实模型。** 别拿它判断你在用哪个模型，
+  唯一的判据是换 key 之后行为/自报身份有没有变。
 
 ## 安装与运行
 
@@ -25,86 +34,88 @@ Windows / Linux 通用（纯 Python，无平台相关代码）。
 python -m venv .venv
 # Linux/macOS
 .venv/bin/pip install -r requirements.txt
-# Windows
-.venv\Scripts\pip install -r requirements.txt
-
-# Linux/macOS
 .venv/bin/python main.py
 # Windows
+.venv\Scripts\pip install -r requirements.txt
 .venv\Scripts\python main.py
 ```
 
-默认监听 `127.0.0.1:5050`。前置条件是本机已经登录过 Qoder CLI：
-
-```bash
-npm install -g @qoder-ai/qodercli
-qodercli login
-```
+默认监听 `127.0.0.1:5050`。前置条件是本机登录过对应区的 CLI：国际版 `qodercli login`（写 `~/.qoder/.auth/`），
+CN 版 `qodercn login`（写 `~/.qoder-cn/.auth/`）。
 
 ## 接口
 
-请求/响应的**形状**按 DeepSeek 那套来（DeepSeek 本身是 OpenAI 兼容，所以 OpenAI 客户端也能直接用），
-模型名固定是 **`qwen3.8-flash`**：
+请求/响应形状按 DeepSeek 那套（DeepSeek 本身是 OpenAI 兼容，所以 OpenAI 客户端也能直接用）：
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/chat/completions` | DeepSeek 官方 base_url 形式 |
 | POST | `/v1/chat/completions` | OpenAI SDK 形式 |
-| GET | `/models`、`/v1/models` | `qwen3.8-flash` |
-| GET | `/health` | 是否就绪 + 凭据概览（不含密钥） |
+| GET | `/models`、`/v1/models` | 当前 region 可用的模型名 |
+| GET | `/health` | 是否就绪 + region + 账号概览（详情需带 key） |
 
 ```bash
-curl http://127.0.0.1:5050/chat/completions \
-  -H 'Content-Type: application/json' \
+curl http://127.0.0.1:5050/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer <key>' \
   -d '{
-        "model": "qwen3.8-flash",
+        "model": "deepseek-v4-pro",
         "messages": [{"role": "user", "content": "你好"}],
         "stream": false
       }'
 ```
 
-当 OpenAI / DeepSeek 客户端接：
-
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:5050", api_key="unused")  # 没设 QODER_API_KEY 时 key 随便填
-client.chat.completions.create(model="qwen3.8-flash", messages=[{"role": "user", "content": "你好"}])
+client = OpenAI(base_url="http://127.0.0.1:5050/v1", api_key="<key>")
+client.chat.completions.create(model="kimi-k3", messages=[{"role": "user", "content": "你好"}])
 ```
 
-`model` 字段只用于回显（填别的名字也能跑，只是不推荐）。
+## 模型
+
+`model` 传**左边**的名字（网关翻成右边的 key 发出去）。认不出的名字直接 400 报错并列出可用项 ——
+**不会**静默回落。
+
+| 模型名 | Qoder key | 自报身份（实测） |
+|---|---|---|
+| `qwen3.8-flash` | `qfmodel` | 通义千问 |
+| `qwen3.8-max` | `qmodel_38max` | — |
+| `qwen` | `qmodel` | 通义千问 |
+| `glm-5.3` | `gmodel` | Z.ai |
+| `deepseek-v4-pro` | `dmodel` | 深度求索 |
+| `kimi-k3` | `kmodel_latest` | Moonshot AI |
+| `auto` | `auto` | 服务端自选 |
+
+也接受直接传 key（`"model": "gmodel"`）。**要加新模型**：跑一次官方 CLI 并抓 `X-Model-Key`：
+
+```bash
+BUN_OPTIONS="--preload /tmp/sniff-bun.js" qodercn -p hi -m "模型显示名"
+grep -a -A20 agent_chat_generation /tmp/sniff-bun.log | grep -i x-model-key
+```
+
+（CN 版 CLI 是 Bun 编译的单文件二进制，Node 的 `--require` 钩子对它无效，得用 `BUN_OPTIONS=--preload`。）
 
 ## 思考强度
 
-模型本身支持思考，档位用 DeepSeek 那套参数控制：
-
 | 参数 | 作用 |
 |---|---|
-| `reasoning_effort` | `none` / `low` / `medium` / `high` / `xhigh` / `max`，直接定档 |
+| `reasoning_effort` | `none` / `low` / `medium` / `high` / `xhigh` / `max` |
 | `thinking: {"type": "enabled"}` | 只开不定档，等于 `medium`；`disabled` 等于 `none` |
 | 都不给 | 默认 `none`（关思考最快） |
 
-开了思考时，思维链走 DeepSeek 的 `reasoning_content` 字段回来（流式里是逐块的 delta）。
+思维链走 DeepSeek 的 `reasoning_content` 字段回来（流式是逐块 delta）。
 
-同一道题（9.11 vs 9.9）实测：
-
-| effort | 耗时 | 思考字数 | 结果 |
-|---|---|---|---|
-| `none` | 1.2s | 0 | ❌ 答成 9.11 大 |
-| `low` | 5.5s | 1235 | ✅ |
-| `medium` | 6.4s | 1421 | ✅ |
-| `high` | 4.1s | 768 | ✅ |
-
-越往上思考越长（`max` 实测 3293 字思考、15s），按需要选。
+**但别指望它精确控深。** 实测：`none` 是唯一确定的（稳定 0 字思考、亚秒级）；`medium`/`high` 之间
+**没有稳定顺序**（同一档连测三次，思考量差 5~20 倍，甚至 `high` 比 `medium` 还短）。把它当成
+「开/关 + 粗略倾向」用，不要当成可调旋钮。
 
 ## 配置
 
-两种方式，**环境变量优先于配置文件**。
-
-配置文件 `config.json`（与 `main.py` 同目录，已在 `.gitignore` 里，权限建议 600）：
+两种方式，**环境变量优先于配置文件**。`config.json`（与 `main.py` 同目录，已 gitignore，建议 600）：
 
 ```json
 {
   "api_key": "qf-...",
+  "region": "cn",
   "host": "127.0.0.1",
   "port": 5050
 }
@@ -113,45 +124,23 @@ client.chat.completions.create(model="qwen3.8-flash", messages=[{"role": "user",
 | 键 / 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `api_key` / `QODER_API_KEY` | 空 | 设了之后调用必须带 `Authorization: Bearer <key>` |
+| `region` / `QODER_REGION` | `intl` | `cn` 或 `intl`，决定端点和凭据目录 |
 | `host` / `QODER_HOST` | `127.0.0.1` | 监听地址 |
 | `port` / `QODER_PORT` | `5050` | 端口（也可用 `--port`） |
 
-生成 / 轮换 key：
-
 ```bash
-python main.py --gen-key      # 生成新 key 写入 config.json（600），然后重启服务
+python main.py --gen-key      # 生成/轮换 key 写入 config.json（600），然后重启服务
 ```
 
-`/health` 不需要 key（方便探活），但**账号详情**（uid/姓名/是否过期）只有带对 key 才返回；
-key 没配时一切如前，不做校验。
-
-## 开机自启
-
-Linux（systemd）：
-
-```ini
-# /etc/systemd/system/qoder-flash.service
-[Unit]
-Description=Qoder Flash Gateway
-After=network-online.target
-
-[Service]
-User=<你的用户名>
-WorkingDirectory=<项目绝对路径>
-ExecStart=<项目绝对路径>/.venv/bin/python main.py
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Windows：`python main.py` 直接用，或用「任务计划程序」加一个「登录时/开机时」触发的任务。
+`/health` 不需要 key（探活用，只回 `{"ready":true}`）；**账号详情**（region/模型表/uid/姓名/是否过期）
+要带对 key。
 
 ## 已知限制
 
-- **不做 token 自动刷新**：`dt-` 过期后（`/health` 会显示 `token_expired: true`）重新
-  `qodercli login` 一次即可。刻意不做刷新是因为刷新可能轮换掉 CLI 自己那份凭据，
-  把 CLI 弄掉线——只读更安全。
-- 只跑 Flash，不支持切模型（免费账号上别的模型会 402）。
-- `usage` 里的 token 统计恒为 0：老版响应里没有可直接用的计数。
+- **`usage` 恒为 0**：老版响应里没有可用计数，客户端要自己估 token。
+- **不做 token 自动刷新**：过期后（`/health` 的 `token_expired: true`）重新登录一次即可。
+  刻意不刷新是因为刷新会轮换掉 CLI 自己那份凭据，把 CLI 弄掉线。
+- **GLM 会把思考混进正文**：`glm-5.3` 的思考过程直接写在 `content` 里（不是 `reasoning_content`），
+  偶尔还会看到它自言自语。这是模型/服务端的怪癖，网关层改不了。
+- **intl 免费号只有 Flash 能用**：`qwen3.8-max` 在那边会**挂住不返回**（不是报错，是超时）。
 - 协议是逆向来的，Qoder 改服务端就可能失效；失效时先看 `/health` 和返回的错误详情。

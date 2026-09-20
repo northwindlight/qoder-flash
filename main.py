@@ -1,4 +1,4 @@
-"""Qoder Flash Gateway —— 把本机 Qoder 登录态变成一个 OpenAI / DeepSeek 兼容接口，只跑 Qwen3.8-Flash。
+"""Qoder Gateway —— 把本机 Qoder 登录态变成一个 OpenAI / DeepSeek 兼容接口，可选模型。
 
 启动：
     python main.py                        # 默认 127.0.0.1:5050
@@ -27,13 +27,16 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
 from qoder import (
-    MODEL_DISPLAY,
-    MODEL_NAME,
+    DEFAULT_MODEL,
+    DEFAULT_REGION,
+    REGION_MODELS,
     Credentials,
     QoderError,
     complete_chat,
     credential_summary,
     load_credentials,
+    resolve_model_key,
+    resolve_region,
     stream_chat,
 )
 
@@ -46,7 +49,7 @@ def load_config() -> dict[str, Any]:
     """配置文件 + 环境变量；环境变量优先。
 
     config.json（与 main.py 同目录，建议 600，已在 .gitignore 里）：
-        {"api_key": "qf-...", "host": "127.0.0.1", "port": 5050}
+        {"api_key": "qf-...", "region": "cn", "host": "127.0.0.1", "port": 5050}
     """
     config: dict[str, Any] = {}
     if CONFIG_PATH.exists():
@@ -56,7 +59,8 @@ def load_config() -> dict[str, Any]:
             raise SystemExit(f"config.json 解析失败：{exc}")
         if not isinstance(config, dict):
             raise SystemExit("config.json 顶层必须是一个对象")
-    for env_name, field in (("QODER_API_KEY", "api_key"), ("QODER_HOST", "host"), ("QODER_PORT", "port")):
+    for env_name, field in (("QODER_API_KEY", "api_key"), ("QODER_HOST", "host"),
+                            ("QODER_PORT", "port"), ("QODER_REGION", "region")):
         value = os.getenv(env_name)
         if value:
             config[field] = value
@@ -79,9 +83,9 @@ def write_api_key(key: str) -> None:
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     CONFIG_PATH.chmod(0o600)
 
-# 对外报的模型名。本网关背后只有一个模型（Qwen3.8-Flash），这些名字都指向它，
-# 请求里写哪个就回显哪个，方便把 DeepSeek/OpenAI 客户端直接指过来。
-MODELS = [MODEL_NAME]
+# 对外报的模型名：跟随 region 决定（国际版免费号只有 2 个，CN 号有一整套）。
+REGION = str(CONFIG.get("region") or DEFAULT_REGION).strip().lower()
+MODELS = REGION_MODELS.get(REGION, [DEFAULT_MODEL])
 SYSTEM_FINGERPRINT = "qoder-flash-gateway"
 
 # Qoder 侧的思考强度档位（DeepSeek 的 low/medium/high 都落在这个集合里）
@@ -118,7 +122,7 @@ def check_api_key(authorization: str | None) -> None:
 
 def get_credentials() -> Credentials:
     try:
-        return load_credentials()
+        return load_credentials(region=REGION)
     except QoderError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -138,12 +142,18 @@ def usage_payload() -> dict[str, int]:
 async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """探活不需要 key；但账号详情（uid/姓名/是否过期）只给带 key 的人看。"""
     try:
-        cred = load_credentials()
+        cred = load_credentials(region=REGION)
     except QoderError as exc:
         return {"ready": False, "error": str(exc)} if authorized(authorization) else {"ready": False}
     if not authorized(authorization):
         return {"ready": True}
-    return {"ready": True, "model": MODEL_NAME, "models": MODELS, "credentials": credential_summary(cred)}
+    return {
+        "ready": True,
+        "region": REGION,
+        "default_model": DEFAULT_MODEL,
+        "models": MODELS,
+        "credentials": credential_summary(cred),
+    }
 
 
 @app.get("/models")
@@ -180,13 +190,19 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
         raise HTTPException(status_code=400, detail="messages is required")
     tools = payload.get("tools") if isinstance(payload.get("tools"), list) else None
     effort = resolve_effort(payload)
-    model = str(payload.get("model") or MODELS[0])  # 只用于回显，背后永远是 Flash
+    model = str(payload.get("model") or DEFAULT_MODEL)
+    try:
+        model_key = resolve_model_key(model, REGION)
+    except QoderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
     if not payload.get("stream"):
         try:
-            message = await complete_chat(messages, tools, cred, reasoning_effort=effort)
+            message = await complete_chat(
+                messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
+            )
         except QoderError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         return {
@@ -210,7 +226,9 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     async def event_stream() -> AsyncIterator[str]:
         emitted_role = False
         try:
-            async for delta in stream_chat(messages, tools, cred, reasoning_effort=effort):
+            async for delta in stream_chat(
+                messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
+            ):
                 out: dict[str, Any] = {}
                 if not emitted_role:
                     out["role"] = "assistant"
@@ -251,7 +269,8 @@ def main() -> None:
         return
 
     auth = "需要 Bearer key" if API_KEY else "不校验 key（只监听本机时可用）"
-    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (模型: {MODEL_DISPLAY} / {MODEL_NAME}；{auth})")
+    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (region: {REGION}；默认模型: {DEFAULT_MODEL}；{auth})")
+    print(f"可用模型: {'、'.join(MODELS)}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

@@ -32,16 +32,62 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 # 常量
 # ---------------------------------------------------------------------------
 
-AUTH_DIR = Path.home() / ".qoder" / ".auth"
-
-CHAT_URL = (
-    "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation"
+CHAT_PATH = (
+    "/algo/api/v2/service/pro/sse/agent_chat_generation"
     "?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
 )
 
-MODEL_KEY = "qfmodel"  # Qwen3.8-Flash 在 Qoder 侧的 key（抓 CLI 请求头 X-Model-Key 所得）
-MODEL_NAME = "qwen3.8-flash"
-MODEL_DISPLAY = "Qwen3.8-Flash"
+# 两个区各自的入口域名和凭据目录。CN 把所有服务收在一个网关域名下，
+# 国际版则按 api3 / api2-v2 / center / openapi 分开，这里只用 chat 那个。
+REGIONS: dict[str, dict[str, Any]] = {
+    "intl": {"base": "https://api3.qoder.sh", "auth_dir": Path.home() / ".qoder" / ".auth"},
+    "cn": {"base": "https://gateway.qoder.com.cn", "auth_dir": Path.home() / ".qoder-cn" / ".auth"},
+}
+DEFAULT_REGION = "intl"
+
+
+def resolve_region(region: str | None) -> dict[str, Any]:
+    name = (region or DEFAULT_REGION).strip().lower()
+    if name not in REGIONS:
+        raise QoderError(f"未知 region：{name}（可选：{'、'.join(REGIONS)}）")
+    cfg = dict(REGIONS[name])
+    cfg["name"] = name
+    cfg["chat_url"] = cfg["base"] + CHAT_PATH
+    return cfg
+
+
+# 模型名 → Qoder 侧 key。key 是从官方 CLI 的真实请求头 X-Model-Key 抓出来的
+# （方法见 docs/REVERSE_ENGINEERING.md）。**必须发 key，发显示名服务端不认，会静默回落 auto。**
+MODEL_KEYS: dict[str, str] = {
+    "auto": "auto",
+    "qwen3.8-flash": "qfmodel",
+    "qwen3.8-max": "qmodel_38max",
+    "qwen": "qmodel",
+    "glm-5.3": "gmodel",
+    "deepseek-v4-pro": "dmodel",
+    "kimi-k3": "kmodel_latest",
+}
+
+# 两个区能用的模型不一样：国际版那个免费号只有两个，且 Max 会挂（请求不返回直接超时）
+REGION_MODELS: dict[str, list[str]] = {
+    "intl": ["qwen3.8-flash", "qwen3.8-max"],
+    "cn": ["auto", "qwen3.8-flash", "qwen3.8-max", "qwen", "glm-5.3", "deepseek-v4-pro", "kimi-k3"],
+}
+
+DEFAULT_MODEL = "qwen3.8-flash"
+
+
+def resolve_model_key(model: str | None, region: str = DEFAULT_REGION) -> str:
+    """把请求里的模型名翻成 Qoder 的 key；认不出就报错，绝不静默回落。"""
+    name = str(model or DEFAULT_MODEL).strip()
+    key = MODEL_KEYS.get(name.lower())
+    if key:
+        return key
+    # 直接给 key 也认（方便没进表的新模型）
+    if name in MODEL_KEYS.values():
+        return name
+    available = REGION_MODELS.get(region, [])
+    raise QoderError(f"未知模型 {name!r}；{region} 可用：{'、'.join(available)}")
 
 COSY_VERSION = "1.1.58"
 COSY_SECRET = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw=="  # base64("war, war never changes")
@@ -81,9 +127,9 @@ class Credentials:
     expires_at: int  # unix 秒，0 表示未知
 
 
-def load_credentials(auth_dir: Path | None = None) -> Credentials:
-    """解密本机 Qoder CLI 写下的登录凭据。"""
-    auth_dir = auth_dir or AUTH_DIR
+def load_credentials(auth_dir: Path | None = None, region: str | None = None) -> Credentials:
+    """解密本机 Qoder CLI 写下的登录凭据（可用 auth_dir 直接指定，或让 region 决定）。"""
+    auth_dir = Path(auth_dir) if auth_dir else resolve_region(region)["auth_dir"]
     id_path = auth_dir / "id"
     if not id_path.exists():
         id_path = auth_dir / "machine_id"
@@ -142,8 +188,8 @@ def _new_machine() -> tuple[str, str]:
     return machine_token, uuid.uuid4().hex[:18]
 
 
-def build_headers(cred: Credentials, body: str) -> dict[str, str]:
-    """构造老版协议的 COSY 鉴权头；签名覆盖 body 与路径。"""
+def build_headers(cred: Credentials, body: str, chat_url: str, model_key: str) -> dict[str, str]:
+    """构造老版协议的 COSY 鉴权头；签名覆盖 body 与路径，模型 key 走 X-Model-Key 头。"""
     temp_key = uuid.uuid4().hex[:16].encode("ascii")
     cosy_key = base64.b64encode(_rsa_encrypt(temp_key)).decode()
 
@@ -167,7 +213,7 @@ def build_headers(cred: Credentials, body: str) -> dict[str, str]:
     ).decode()
 
     date = str(int(time.time()))
-    path = urlparse(CHAT_URL).path
+    path = urlparse(chat_url).path
     path_sig = path[len("/algo"):] if path.startswith("/algo") else path
     signature = hashlib.md5(f"{payload_b64}\n{cosy_key}\n{date}\n{body}\n{path_sig}".encode()).hexdigest()
 
@@ -189,7 +235,7 @@ def build_headers(cred: Credentials, body: str) -> dict[str, str]:
         "cosy-machinetoken": machine_token,
         "cosy-machinetype": machine_type,
         "login-version": "v2",
-        "x-model-key": MODEL_KEY,
+        "x-model-key": model_key,
         "x-model-source": "system",
         "user-agent": "Go-http-client/2.0",
     }
@@ -291,9 +337,10 @@ def build_body(
     cred: Credentials,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
+    model_key: str = "qfmodel",
     reasoning_effort: str = "none",
 ) -> dict[str, Any]:
-    """拼出老版端点的请求体（字段名照服务端要求，不能随意增删）。"""
+    """拼出老版端点的请求体（字段名照服务端要求，不能随意增删）。model_key 必须是 Qoder 的 key。"""
     has_tools = bool(tools)
     converted = [m for m in (_convert_message(m, has_tools) for m in messages) if m]
     prompt = ""
@@ -314,7 +361,7 @@ def build_body(
             "chatPrompt": "",
             "extra": {
                 "context": [],
-                "modelConfig": {"is_reasoning": False, "key": MODEL_KEY},
+                "modelConfig": {"is_reasoning": False, "key": model_key},
                 "originalContent": {"type": "text", "text": prompt},
             },
             "features": [],
@@ -336,8 +383,8 @@ def build_body(
         "agent_id": "agent_common",
         "task_id": "common",
         "model_config": {
-            "key": MODEL_KEY,
-            "display_name": MODEL_DISPLAY,
+            "key": model_key,
+            "display_name": model_key,
             "model": "",
             "format": "openai",
             "is_vl": False,
@@ -409,15 +456,19 @@ async def stream_chat(
     cred: Credentials | None = None,
     timeout: float = 300.0,
     reasoning_effort: str = "none",
+    region: str = DEFAULT_REGION,
+    model_key: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """向 Qoder 发起一次流式对话，逐块吐出 delta。"""
-    cred = cred or load_credentials()
-    body = build_body(cred, messages, tools, reasoning_effort)
+    cfg = resolve_region(region)
+    cred = cred or load_credentials(region=region)
+    key = model_key or resolve_model_key(None, cfg["name"])
+    body = build_body(cred, messages, tools, key, reasoning_effort)
     encoded = encode_body(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
-    headers = build_headers(cred, encoded)
+    headers = build_headers(cred, encoded, cfg["chat_url"], key)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15)) as client:
-        async with client.stream("POST", CHAT_URL, content=encoded.encode(), headers=headers) as response:
+        async with client.stream("POST", cfg["chat_url"], content=encoded.encode(), headers=headers) as response:
             if response.status_code != 200:
                 detail = (await response.aread()).decode(errors="replace")
                 if response.status_code in (401, 403):
@@ -465,12 +516,16 @@ async def complete_chat(
     tools: list[dict[str, Any]] | None = None,
     cred: Credentials | None = None,
     reasoning_effort: str = "none",
+    region: str = DEFAULT_REGION,
+    model_key: str | None = None,
 ) -> dict[str, Any]:
     """非流式：把流式结果拼成一条完整回复。"""
     parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
-    async for delta in stream_chat(messages, tools, cred, reasoning_effort=reasoning_effort):
+    async for delta in stream_chat(
+        messages, tools, cred, reasoning_effort=reasoning_effort, region=region, model_key=model_key
+    ):
         if delta["content"]:
             parts.append(delta["content"])
         if delta["reasoning"]:

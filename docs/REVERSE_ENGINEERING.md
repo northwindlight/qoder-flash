@@ -1,6 +1,7 @@
 # 逆向记录：这个网关是怎么调通的
 
-> 2026-09-20 · 对象：`@qoder-ai/qodercli` 1.1.58（Node bundle）· 平台：Raspberry Pi 5 / Debian 13
+> 2026-09-20 · 对象：`@qoder-ai/qodercli` 1.1.58（国际版，Node bundle）与 CN 版 `qoderclicn` 1.1.58
+> （Bun 编译的 aarch64 单文件二进制）· 平台：Raspberry Pi 5 / Debian 13
 >
 > 结论先说：**没有破解 TLS，也没有反混淆那个 33MB 的 bundle。** 真正解决问题的是在
 > **客户端进程内部、加密发生之前的那一层**，把客户端自己成功发出的那条请求抄了下来。
@@ -175,6 +176,20 @@ else if (marked.has(this)) { fs.appendFileSync('/tmp/sniff-body.bin', chunk); }
 
 ---
 
+## 4.4 补记：CN 版是 Bun 二进制，Node 钩子无效
+
+CN 版 CLI 是**单个 aarch64 ELF**（184MB，Bun 编译，内嵌 JS）。同一个 socket 钩子在这里完全不触发：
+`NODE_OPTIONS=--require` 不生效（Bun 不认），`LD_PRELOAD` 也拦不到（BoringSSL 静态链接、
+`SSLKEYLOGFILE` 同样被编译掉）。**能用的是 `BUN_OPTIONS=--preload`**：
+
+```bash
+BUN_OPTIONS="--preload /tmp/sniff-bun.js" qodercn -p hi -m "GLM-5.3"
+# /tmp/sniff-bun.log 里就有明文请求头：X-Model-Key: gmodel
+```
+
+同一个钩子脚本（钩 `node:net` 的 `Socket.prototype.write`）在 Bun 下照样有效，因为明文同样要在
+**加密之前**经过 socket 写入。
+
 ## 5. 拿到之后必须验证 —— 抄来的只是假设
 
 抓到的 header 只是**假设**。真正的确认是重放：
@@ -192,16 +207,55 @@ else if (marked.has(this)) { fs.appendFileSync('/tmp/sniff-body.bin', chunk); }
 | `parameters.reasoning_effort = "none"` | **0.8s** |
 | 顶层 `reasoningEffort = "none"` | 23.1s（无效，传错层了） |
 
-六档 `none/low/medium/high/xhigh/max` 服务端全认，思考量逐档变长（`max` 实测 3293 字思考 / 15s）。
-**这个参数不显式给，服务端默认长思考** —— 一句「说三个字」要 30 秒以上。
+六档 `none/low/medium/high/xhigh/max` 服务端全认。**这个参数不显式给，服务端默认长思考** ——
+一句「说三个字」要 30 秒以上。
 
-另一组实测说明了思考到底值不值：
+> **订正（后被推翻的一半）**：最初单次实测看起来"档位越高思考越长"，据此写过一张漂亮的表。
+> 后来重复测发现**档位不精确控深**：同一档连测三次，思考量差 5~20 倍，`high` 甚至比 `medium` 还短。
+> 唯一稳定的是 `none`（确定 0 字思考、亚秒级）。所以正确的说法是：
+> **`reasoning_effort` 是个「开/关 + 粗略倾向」，不是可调旋钮。**
+> 教训：单次样本 + 无重复 = 会得到看起来很有道理的错误结论。
+
+关思考确实会答错（这条重复验证过）：
 
 | effort | 耗时 | 思考字数 | 「9.11 和 9.9 哪个大」 |
 |---|---|---|---|
 | `none` | 1.2s | 0 | ❌ 答成 9.11 大 |
 | `low` | 5.5s | 1235 | ✅ |
-| `medium` | 6.4s | 1421 | ✅ |
+
+---
+
+## 5.2 真正的坑（最贵的一条）：模型名必须发 key，发显示名会**静默回落**
+
+这是整件事里最贵的教训，也是最容易得出错误结论的地方。
+
+CLI 的 `--list-models` 给人看的是**显示名**（`GLM-5.3`、`Kimi-K3`…），而线上发出去的是**内部 key**
+（`gmodel`、`kmodel_latest`…）。两者不是一回事：
+
+| 你发的东西 | 服务端行为 |
+|---|---|
+| 正确的 key（`gmodel`） | 真的用 GLM |
+| 显示名（`GLM-5.3`） | **不报错**，静默回落到 `auto` |
+| 自己编的 key | 可能直接**挂住不返回**（不报错，等到超时） |
+
+而且回包里的 `model` 字段恒为 `"auto"`，**永远不告诉你实际用了哪个模型**。两条叠加的结果是：
+
+> 发错值 → 不报错 → 回包说 auto → 你以为"这服务就是只能 auto"。
+
+我们一度就得出了「国际版根本不是 qwen3.8-flash、档位是假的」这个结论，直到用 **"你是哪家训练的模型"**
+去问才知道：把 key 发对（`qfmodel`），国际版跑的确实就是 Qwen3.8-Flash；发 `gmodel` 会答「智谱/Z.ai」；
+发 `kmodel_latest` 会答「Moonshot AI」—— **模型选择是真的，只是我们用错了参数**。
+
+可用的判据只有一条：**换 key 之后，行为或自报身份有没有变**。别信回包字段，也别信延迟。
+
+实测对照（同一句话问身份）：
+
+| 发出的 key | 回答 |
+|---|---|
+| `qfmodel` | 通义千问 |
+| `gmodel` | Z.ai（且思考过程直接泄进正文，这是 GLM 的怪癖） |
+| `dmodel` | 深度求索 |
+| `kmodel_latest` | Moonshot AI |
 
 ---
 
@@ -209,10 +263,13 @@ else if (marked.has(this)) { fs.appendFileSync('/tmp/sniff-body.bin', chunk); }
 
 Qoder 换个版本、改个协议，上面这套可能要重跑。顺序是固定的：
 
-1. **先跑通官方客户端**（`qodercli -p "hi" -m <模型>`），确认它此刻是好的。
-2. **挂 socket 钩子**把它的请求抄下来：
+1. **先跑通官方客户端**（`qodercli` / `qodercn` 加 `-p "hi" -m <模型>`），确认它此刻是好的。
+2. **挂钩子**把它的请求抄下来 —— 按客户端类型选：
    ```bash
+   # 国际版（Node）
    NODE_OPTIONS="--require /tmp/sniff.cjs" qodercli -p "hi" -m Qwen3.8-Flash
+   # CN 版（Bun 单文件二进制）
+   BUN_OPTIONS="--preload /tmp/sniff-bun.js" qodercn -p "hi" -m "GLM-5.3"
    ```
    看 `X-Model-Key`、`Cosy-Version`、包体编码方式有没有变。
 3. **重放验证**：用我们自己的签名器打一发，确认 200 且出内容。
