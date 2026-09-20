@@ -16,9 +16,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import time
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
@@ -37,7 +39,45 @@ from qoder import (
 
 app = FastAPI(title="Qoder Flash Gateway", version="0.1.0")
 
-API_KEY = os.getenv("QODER_API_KEY", "").strip()
+CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+def load_config() -> dict[str, Any]:
+    """配置文件 + 环境变量；环境变量优先。
+
+    config.json（与 main.py 同目录，建议 600，已在 .gitignore 里）：
+        {"api_key": "qf-...", "host": "127.0.0.1", "port": 5050}
+    """
+    config: dict[str, Any] = {}
+    if CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"config.json 解析失败：{exc}")
+        if not isinstance(config, dict):
+            raise SystemExit("config.json 顶层必须是一个对象")
+    for env_name, field in (("QODER_API_KEY", "api_key"), ("QODER_HOST", "host"), ("QODER_PORT", "port")):
+        value = os.getenv(env_name)
+        if value:
+            config[field] = value
+    return config
+
+
+CONFIG = load_config()
+API_KEY = str(CONFIG.get("api_key") or "").strip()
+
+
+def generate_key() -> str:
+    return "qf-" + secrets.token_urlsafe(24)
+
+
+def write_api_key(key: str) -> None:
+    data = {}
+    if CONFIG_PATH.exists():
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    data["api_key"] = key
+    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    CONFIG_PATH.chmod(0o600)
 
 # 对外报的模型名。本网关背后只有一个模型（Qwen3.8-Flash），这些名字都指向它，
 # 请求里写哪个就回显哪个，方便把 DeepSeek/OpenAI 客户端直接指过来。
@@ -64,11 +104,15 @@ def resolve_effort(payload: dict[str, Any]) -> str:
     return "none"
 
 
-def check_api_key(authorization: str | None) -> None:
+def authorized(authorization: str | None) -> bool:
     if not API_KEY:
-        return
+        return True
     token = authorization[len("Bearer "):].strip() if authorization and authorization.startswith("Bearer ") else ""
-    if token != API_KEY:
+    return secrets.compare_digest(token, API_KEY)
+
+
+def check_api_key(authorization: str | None) -> None:
+    if not authorized(authorization):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
@@ -91,11 +135,14 @@ def usage_payload() -> dict[str, int]:
 
 
 @app.get("/health")
-async def health() -> dict[str, Any]:
+async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """探活不需要 key；但账号详情（uid/姓名/是否过期）只给带 key 的人看。"""
     try:
         cred = load_credentials()
     except QoderError as exc:
-        return {"ready": False, "error": str(exc)}
+        return {"ready": False, "error": str(exc)} if authorized(authorization) else {"ready": False}
+    if not authorized(authorization):
+        return {"ready": True}
     return {"ready": True, "model": MODEL_NAME, "models": MODELS, "credentials": credential_summary(cred)}
 
 
@@ -191,11 +238,20 @@ def main() -> None:
     import uvicorn
 
     parser = argparse.ArgumentParser(description="Qoder Flash Gateway")
-    parser.add_argument("--host", default=os.getenv("QODER_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("QODER_PORT", "5050")))
+    parser.add_argument("--host", default=str(CONFIG.get("host") or "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(CONFIG.get("port") or 5050))
+    parser.add_argument("--gen-key", action="store_true", help="生成一个新 API key 写入 config.json 后退出")
     args = parser.parse_args()
 
-    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (背后模型: {MODEL_DISPLAY} / {MODEL_NAME})")
+    if args.gen_key:
+        key = generate_key()
+        write_api_key(key)
+        print(f"已写入 {CONFIG_PATH}（600）:\n  api_key = {key}")
+        print("重启服务生效：sudo systemctl restart qoder-flash")
+        return
+
+    auth = "需要 Bearer key" if API_KEY else "不校验 key（只监听本机时可用）"
+    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (模型: {MODEL_DISPLAY} / {MODEL_NAME}；{auth})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

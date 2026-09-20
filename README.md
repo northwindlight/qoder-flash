@@ -98,11 +98,32 @@ client.chat.completions.create(model="qwen3.8-flash", messages=[{"role": "user",
 
 ## 配置
 
-| 环境变量 | 默认 | 说明 |
+两种方式，**环境变量优先于配置文件**。
+
+配置文件 `config.json`（与 `main.py` 同目录，已在 `.gitignore` 里，权限建议 600）：
+
+```json
+{
+  "api_key": "qf-...",
+  "host": "127.0.0.1",
+  "port": 5050
+}
+```
+
+| 键 / 环境变量 | 默认 | 说明 |
 |---|---|---|
-| `QODER_HOST` | `127.0.0.1` | 监听地址（给局域网用就设 `0.0.0.0`） |
-| `QODER_PORT` | `5050` | 端口（也可用 `--port`） |
-| `QODER_API_KEY` | 空 | 设了之后调用必须带 `Authorization: Bearer <key>`；对局域网暴露时建议设 |
+| `api_key` / `QODER_API_KEY` | 空 | 设了之后调用必须带 `Authorization: Bearer <key>` |
+| `host` / `QODER_HOST` | `127.0.0.1` | 监听地址 |
+| `port` / `QODER_PORT` | `5050` | 端口（也可用 `--port`） |
+
+生成 / 轮换 key：
+
+```bash
+python main.py --gen-key      # 生成新 key 写入 config.json（600），然后重启服务
+```
+
+`/health` 不需要 key（方便探活），但**账号详情**（uid/姓名/是否过期）只有带对 key 才返回；
+key 没配时一切如前，不做校验。
 
 ## 开机自启
 
