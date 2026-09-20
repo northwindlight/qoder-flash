@@ -16,6 +16,9 @@ Windows / Linux 通用（纯 Python，无平台相关代码）。
 为什么走老版端点：免费账号的 **Qwen3.8-Flash 是无限量的**，而这条路是唯一能用到它的
 （新版 OpenAI 兼容端点对这类账号只放行 `lite`，其余模型一律 `402 quota exceeded`）。
 
+> 上面这套协议是怎么逆出来的、走过哪些死路、版本更新后怎么重来一遍 —— 见
+> [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)。
+
 ## 安装与运行
 
 ```bash
