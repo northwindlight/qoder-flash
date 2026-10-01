@@ -247,6 +247,12 @@ def build_headers(cred: Credentials, body: str, chat_url: str, model_key: str) -
 
 
 def _response_meta() -> dict[str, Any]:
+    """请求体里的 usage 占位。
+
+    ★ 这里的 0 **不代表上游计数是 0**（曾误当成"上游不给计数"，其实上游一直在报）。
+    真数在**响应**那条收尾 chunk 的 `usage` 上，由 `_parse_chunk` 透出，不从这儿来。
+    这个占位只是请求体结构的一部分。
+    """
     return {
         "id": "",
         "usage": {
@@ -430,6 +436,12 @@ def _parse_chunk(raw: str) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             return []
 
+    # ★ 用量就在这一条上（`choices` 为空的收尾 chunk）。上游给的是**整次请求的累计值**，
+    #   不是增量：prompt_tokens / completion_tokens / prompt_tokens_details.cached_tokens，
+    #   外加 Qoder 自己的 credits（计费点数）。老版本把这条整段丢掉 ⇒ 网关只能回全 0，
+    #   客户端只能退回本地估算（2026-10-02 实测：上游一直在报，是这里漏读）。
+    usage = payload.get("usage")
+
     out: list[dict[str, Any]] = []
     for choice in payload.get("choices") or []:
         if not isinstance(choice, dict):
@@ -447,6 +459,14 @@ def _parse_chunk(raw: str) -> list[dict[str, Any]]:
                     "finish_reason": choice.get("finish_reason"),
                 }
             )
+    if isinstance(usage, dict) and usage:
+        if out:
+            out[-1]["usage"] = usage
+        else:
+            # 纯用量收尾（真流里 `choices` 是空的）：造一条只带 usage 的 delta 往上吐，
+            # 消费方按 content/reasoning 取用时自然不会受影响。
+            out.append({"role": "", "content": "", "reasoning": "",
+                        "tool_calls": None, "finish_reason": None, "usage": usage})
     return out
 
 
@@ -519,13 +539,20 @@ async def complete_chat(
     region: str = DEFAULT_REGION,
     model_key: str | None = None,
 ) -> dict[str, Any]:
-    """非流式：把流式结果拼成一条完整回复。"""
+    """非流式：把流式结果拼成一条完整回复。
+
+    返回的 message 里可能带 `usage`（上游这次真报了的话）——**网关取走它再删掉**，
+    别让它混进 OpenAI 的 message 结构。
+    """
     parts: list[str] = []
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
+    usage: dict[str, Any] | None = None
     async for delta in stream_chat(
         messages, tools, cred, reasoning_effort=reasoning_effort, region=region, model_key=model_key
     ):
+        if delta.get("usage"):
+            usage = delta["usage"]
         if delta["content"]:
             parts.append(delta["content"])
         if delta["reasoning"]:
@@ -537,6 +564,8 @@ async def complete_chat(
         message["reasoning_content"] = "".join(reasoning_parts)
     if tool_calls:
         message["tool_calls"] = merge_tool_calls(tool_calls)
+    if usage:
+        message["usage"] = usage
     return message
 
 

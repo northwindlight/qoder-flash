@@ -3,3 +3,9 @@ __pycache__/
 *.py[cod]
 .env
 config.json
+
+# 用量台账（运行时产物，按本机累计，不入库）
+usage-ledger.jsonl
+
+# 部署时的备份
+*.bak-*

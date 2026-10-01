@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import secrets
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -127,15 +128,115 @@ def get_credentials() -> Credentials:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-def usage_payload() -> dict[str, int]:
-    """DeepSeek 的 usage 多两个缓存计数字段；老版协议拿不到计数，一律给 0。"""
-    return {
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-        "prompt_cache_hit_tokens": 0,
-        "prompt_cache_miss_tokens": 0,
+# ★ 用量台账：每完成一次调用追加一行 JSONL，并把累计值给 /stats。
+#   为什么值得记：上游**每一块都带真实计数**（含 cached_tokens 与 credits），
+#   老版本全丢掉了（2026-10-02 之前 usage 恒为 0）。记下来才能回答
+#   「这一局到底花了多少 token / 多少 credits」这种问题。
+LEDGER_PATH = Path(os.getenv("QODER_LEDGER") or (Path(__file__).with_name("usage-ledger.jsonl")))
+
+# 进程内累计（不读盘，给 /stats 的 session 段）。uvicorn 单进程跑，锁只是防并发请求。
+_USAGE_LOCK = threading.Lock()
+_USAGE: dict[str, dict[str, Any]] = {}
+
+
+def _accumulate(model: str, rec: dict[str, Any]) -> None:
+    with _USAGE_LOCK:
+        slot = _USAGE.setdefault(str(model or "?"), {
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "cached_tokens": 0, "reasoning_tokens": 0,
+            "credits": 0.0, "errors": 0})
+        slot["calls"] += 1
+        if rec.get("error"):
+            slot["errors"] += 1
+        for k in ("prompt_tokens", "completion_tokens", "total_tokens",
+                  "cached_tokens", "reasoning_tokens"):
+            try:
+                slot[k] += int(rec.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        try:
+            slot["credits"] += float(rec.get("credits") or 0.0)
+        except (TypeError, ValueError):
+            pass
+
+
+def usage_payload(prompt: int = 0, completion: int = 0, hit: int = 0, miss: int | None = None,
+                  credits: float | None = None, reasoning: int | None = None) -> dict[str, Any]:
+    """把上游真实计数翻成 DeepSeek 拼法的 usage（客户端认这一套）。
+
+    - `prompt_tokens` 是**输入总量**，`prompt_cache_hit_tokens` 是其中命中前缀缓存的
+      那一部分，所以 `miss = prompt - hit`。客户端就是这么反推 miss 的。
+    - 命中的那部分**单价便宜得多**（实测 11.6k 前缀：冷 0.3225 credits、全命中 0.0260，
+      差 12.4 倍），所以 hit 必须如实报，不能省。
+    - `reasoning`（思考 token）走 `completion_tokens_details.reasoning_tokens`，
+      与 `prompt_tokens_details.cached_tokens` 是**兄弟字段**。★ 曾经漏读这个兄弟，
+      结果客户端只拿到 `completion_tokens=132` 却看到"思考 0"——比不报还坑
+      （实测上游确实给：132 输出里 128 是思考）。给了才写，没给就不写这个键，
+      免得用一个假的 0 盖掉客户端自己的估算。
+    - miss 允许显式给（上游给了就用它的），否则按 prompt - hit 算。
+    """
+    prompt = max(0, int(prompt))
+    hit = max(0, min(int(hit), prompt))
+    miss = max(0, prompt - hit) if miss is None else max(0, int(miss))
+    out: dict[str, Any] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": max(0, int(completion)),
+        "total_tokens": prompt + max(0, int(completion)),
+        "prompt_cache_hit_tokens": hit,
+        "prompt_cache_miss_tokens": miss,
     }
+    if reasoning is not None:
+        out["completion_tokens_details"] = {"reasoning_tokens": max(0, int(reasoning))}
+    if credits is not None:
+        out["credits"] = round(float(credits), 6)
+    return out
+
+
+def _reasoning_tokens(up: dict[str, Any], reasoning_text: str) -> int | None:
+    """思考 token：优先上游真数，没有就按思考文本本地估。
+
+    估的时候要**限制在 completion_tokens 以内**——本地估是字符数近似，可能比上游的
+    总输出还大，那种数看着就不对（思考不可能超过全部输出）。上游连 completion 都没报
+    时才不限制。返回 None 表示"连估都估不出"（没有思考文本），此时调用方不写这个键。
+    """
+    det = up.get("completion_tokens_details") or {}
+    reported = det.get("reasoning_tokens")
+    if reported is not None:
+        return int(reported)
+    if not reasoning_text:
+        return None
+    est = _est_tokens(reasoning_text)
+    cap = int(up.get("completion_tokens") or 0)
+    return min(est, cap) if cap else est
+
+
+def _write_ledger(rec: dict[str, Any]) -> None:
+    try:
+        with LEDGER_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:                       # 记账失败不能影响转发
+        print(f"[台账] 写入失败（不影响转发）：{exc}", flush=True)
+
+
+def _read_ledger(limit: int = 200000) -> list[dict[str, Any]]:
+    if not LEDGER_PATH.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        with LEDGER_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    rows.append(rec)
+    except OSError:
+        return rows
+    return rows[-limit:]
 
 
 @app.get("/health")
@@ -163,6 +264,74 @@ async def list_models() -> dict[str, Any]:
         "object": "list",
         "data": [{"id": name, "object": "model", "created": 0, "owned_by": "qoder"} for name in MODELS],
     }
+
+
+def _est_tokens(text: str) -> int:
+    """只在**上游没报**时兜底：CJK 按字、其余按 ~4 字符/token 估。
+
+    宁可标"估"也不装准——但真流里上游一直在报，这条基本走不到（见 chat_completions）。
+    """
+    s = str(text or "")
+    if not s:
+        return 0
+    cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff" or "\u3040" <= ch <= "\u30ff")
+    rest = len(s) - cjk
+    return cjk + max(0, (rest + 3) // 4)
+
+
+@app.get("/stats")
+async def stats(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """累计用量台账（进程内累计 + 落盘 JSONL 的全量重算）。
+
+    `ledger` 是**全量**（跨重启），`calls`/`totals` 是本次进程启动以来的。
+    按模型分组，附命中率与 credits 合计——"这一局花了多少"就看这里。
+    """
+    check_api_key(authorization)
+
+    def _blank() -> dict[str, Any]:
+        return {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "cached_tokens": 0, "reasoning_tokens": 0, "credits": 0.0, "errors": 0}
+
+    def _fold(acc: dict[str, dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        for rec in rows:
+            model = str(rec.get("model") or "?")
+            slot = acc.setdefault(model, _blank())
+            slot["calls"] += 1
+            if rec.get("error"):
+                slot["errors"] += 1
+            for src, dst in (("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"),
+                             ("total_tokens", "total_tokens"), ("cached_tokens", "cached_tokens"),
+                             ("reasoning_tokens", "reasoning_tokens")):
+                try:
+                    slot[dst] += int(rec.get(src) or 0)
+                except (TypeError, ValueError):
+                    pass
+            try:
+                slot["credits"] += float(rec.get("credits") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        return acc
+
+    with _USAGE_LOCK:
+        session = {k: dict(v) for k, v in _USAGE.items()}
+    ledger = _fold({}, _read_ledger())
+
+    def _finish(acc: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        grand = _blank()
+        for slot in acc.values():
+            for k in grand:
+                grand[k] += slot[k]
+        grand["credits"] = round(grand["credits"], 6)
+        for slot in acc.values():
+            slot["credits"] = round(slot["credits"], 6)
+            inp = slot["prompt_tokens"]
+            slot["cache_hit_rate"] = round(slot["cached_tokens"] / inp, 4) if inp else None
+        grand["cache_hit_rate"] = round(grand["cached_tokens"] / grand["prompt_tokens"], 4) if grand["prompt_tokens"] else None
+        return {"by_model": acc, "totals": grand}
+
+    return {"ledger_path": str(LEDGER_PATH),
+            "session": {"by_model": session, **_finish(session)},
+            "ledger": {"by_model": ledger, **_finish(ledger)}}
 
 
 def _chunk(completion_id: str, created: int, model: str, delta: dict[str, Any] | None = None, finish_reason: str | None = None, usage: dict[str, int] | None = None, choices: list[Any] | None = None) -> str:
@@ -204,7 +373,34 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
             )
         except QoderError as exc:
+            _accumulate(model, {"error": 1})
+            _write_ledger({"ts": created, "model": model, "stream": False, "error": str(exc)[:200]})
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        # ★ `usage` 是 qoder.complete_chat 顺手带回来的上游真数，取走后别留在 message 里
+        up = message.pop("usage", None) or {}
+        det = up.get("prompt_tokens_details") or {}
+        prompt = int(up.get("prompt_tokens") or 0)
+        completion = int(up.get("completion_tokens") or 0)
+        hit = int(det.get("cached_tokens") or 0)
+        if not prompt:                       # 上游没报 ⇒ 估，并如实记 estimated
+            prompt = sum(_est_tokens(m.get("content")) for m in messages if isinstance(m, dict))
+            for m in messages:
+                if isinstance(m, dict):
+                    for tc in (m.get("tool_calls") or []):
+                        prompt += _est_tokens(((tc.get("function") or {}).get("arguments")))
+            prompt += _est_tokens(json.dumps(tools, ensure_ascii=False)) if tools else 0
+        if not completion:
+            completion = _est_tokens(message.get("content")) + _est_tokens(message.get("reasoning_content"))
+        credits = up.get("credits")
+        reason = _reasoning_tokens(up, str(message.get("reasoning_content") or ""))
+        rec = {"ts": created, "model": model, "stream": False, "prompt_tokens": prompt,
+               "completion_tokens": completion, "cached_tokens": hit,
+               "prompt_cache_miss_tokens": max(0, prompt - hit),
+               "reasoning_tokens": reason,
+               "credits": float(credits) if credits is not None else None,
+               "reported": bool(up)}
+        _accumulate(model, rec)
+        _write_ledger(rec)
         return {
             "id": completion_id,
             "object": "chat.completion",
@@ -218,17 +414,29 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                     "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
                 }
             ],
-            "usage": usage_payload(),
+            "usage": usage_payload(prompt, completion, hit, credits=credits, reasoning=reason),
         }
 
     include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
 
     async def event_stream() -> AsyncIterator[str]:
         emitted_role = False
+        up: dict[str, Any] = {}          # 上游累计用量（收尾那条带）
+        text_acc: list[str] = []
+        reason_acc: list[str] = []
+        tool_acc: list[str] = []
         try:
             async for delta in stream_chat(
                 messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
             ):
+                if delta.get("usage"):   # 只带用量的收尾 delta：不进 choices，只留着记账
+                    up = delta["usage"]
+                if delta["reasoning"]:
+                    reason_acc.append(delta["reasoning"])
+                if delta["content"]:
+                    text_acc.append(delta["content"])
+                for tc in (delta["tool_calls"] or []):
+                    tool_acc.append(str(((tc or {}).get("function") or {}).get("arguments") or ""))
                 out: dict[str, Any] = {}
                 if not emitted_role:
                     out["role"] = "assistant"
@@ -242,10 +450,41 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 if out or delta["finish_reason"]:
                     yield _chunk(completion_id, created, model, out, delta["finish_reason"])
             yield _chunk(completion_id, created, model, {}, "stop")
+
+            # ---- 记账：优先上游真数，缺哪格才估哪格 ----
+            det = up.get("prompt_tokens_details") or {}
+            prompt = int(up.get("prompt_tokens") or 0)
+            completion = int(up.get("completion_tokens") or 0)
+            hit = int(det.get("cached_tokens") or 0)
+            if not prompt:
+                prompt = sum(_est_tokens(m.get("content")) for m in messages if isinstance(m, dict))
+                for m in messages:
+                    if isinstance(m, dict):
+                        for tc in (m.get("tool_calls") or []):
+                            prompt += _est_tokens(((tc.get("function") or {}).get("arguments")))
+                if tools:
+                    prompt += _est_tokens(json.dumps(tools, ensure_ascii=False))
+            if not completion:
+                completion = _est_tokens("".join(text_acc)) + _est_tokens("".join(reason_acc))
+            credits = up.get("credits")
+            reason = _reasoning_tokens(up, "".join(reason_acc))
+            rec = {"ts": created, "model": model, "stream": True, "prompt_tokens": prompt,
+                   "completion_tokens": completion, "cached_tokens": hit,
+                   "prompt_cache_miss_tokens": max(0, prompt - hit),
+                   "reasoning_tokens": reason,
+                   "credits": float(credits) if credits is not None else None,
+                   "reported": bool(up), "wall": round(time.time() - created, 3)}
+            _accumulate(model, rec)
+            _write_ledger(rec)
+
             if include_usage:
                 # DeepSeek/OpenAI 的约定：usage 单独一个 chunk，choices 为空
-                yield _chunk(completion_id, created, model, usage=usage_payload(), choices=[])
+                yield _chunk(completion_id, created, model,
+                             usage=usage_payload(prompt, completion, hit, credits=credits,
+                                                 reasoning=reason), choices=[])
         except QoderError as exc:
+            _accumulate(model, {"error": 1})
+            _write_ledger({"ts": created, "model": model, "stream": True, "error": str(exc)[:200]})
             yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
 
