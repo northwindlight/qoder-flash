@@ -7,5 +7,8 @@ config.json
 # 用量台账（运行时产物，按本机累计，不入库）
 usage-ledger.jsonl
 
+# 账号池状态（运行时产物：冷却/失败计数，本机有效）
+account-state.json
+
 # 部署时的备份
 *.bak-*
