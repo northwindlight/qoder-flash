@@ -531,15 +531,12 @@ def merge_tool_calls(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
-async def complete_chat(
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] | None = None,
-    cred: Credentials | None = None,
-    reasoning_effort: str = "none",
-    region: str = DEFAULT_REGION,
-    model_key: str | None = None,
-) -> dict[str, Any]:
-    """非流式：把流式结果拼成一条完整回复。
+async def assemble_message(deltas: AsyncIterator[dict[str, Any]]) -> dict[str, Any]:
+    """把一串 delta 拼成一条完整回复。
+
+    ★ 单独抽出来是给多账号 failover 复用：那边要换的只是"流从哪来"，
+      而**工具调用碎片怎么拼**（`merge_tool_calls`：老版协议把一次调用切成好几片、
+      每片 index 都是 0）只该有一份实现，抄第二份迟早抄歪。
 
     返回的 message 里可能带 `usage`（上游这次真报了的话）——**网关取走它再删掉**，
     别让它混进 OpenAI 的 message 结构。
@@ -548,9 +545,7 @@ async def complete_chat(
     reasoning_parts: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     usage: dict[str, Any] | None = None
-    async for delta in stream_chat(
-        messages, tools, cred, reasoning_effort=reasoning_effort, region=region, model_key=model_key
-    ):
+    async for delta in deltas:
         if delta.get("usage"):
             usage = delta["usage"]
         if delta["content"]:
@@ -567,6 +562,21 @@ async def complete_chat(
     if usage:
         message["usage"] = usage
     return message
+
+
+async def complete_chat(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    cred: Credentials | None = None,
+    reasoning_effort: str = "none",
+    region: str = DEFAULT_REGION,
+    model_key: str | None = None,
+) -> dict[str, Any]:
+    """非流式：把流式结果拼成一条完整回复（单账号版本；多账号见 failover.complete_with_failover）。"""
+    return await assemble_message(
+        stream_chat(messages, tools, cred, reasoning_effort=reasoning_effort,
+                    region=region, model_key=model_key)
+    )
 
 
 def credential_summary(cred: Credentials) -> dict[str, Any]:

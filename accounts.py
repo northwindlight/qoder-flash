@@ -38,10 +38,11 @@ from qoder import (
 #   http       其他上游错误（5xx 等）
 #   credential 本地凭据本身有问题（缺失、解密失败、已过期）—— 没发过请求
 #   empty      干净的空流：连上了、正常结束、但一个字都没有
-KINDS = ("timeout", "disconnect", "auth", "http", "credential", "empty")
+#   model      这个账号发不了这个模型（配置问题，不是账号的错）
+KINDS = ("timeout", "disconnect", "auth", "http", "credential", "empty", "model")
 
-# 会让账号进冷却的类别（empty 不进：它很快返回，而且不能证明"这个号废了"）
-COOLING_KINDS = ("timeout", "disconnect", "auth", "http", "credential")
+# 不进冷却的类别：这些要么回得快、要么压根不是账号的错，罚它冷却只会误伤
+NO_COOLDOWN_KINDS = ("empty", "model")
 
 
 def classify(exc: BaseException) -> str:
@@ -375,9 +376,14 @@ class AccountPool:
                 return
             now = time.time()
             state.fail += 1
-            state.streak += 1
             state.last_error = f"{kind}: {detail}"[:300]
             state.last_fail = now
+            if kind in NO_COOLDOWN_KINDS:
+                # 不计入连续失败：`timeout_for` 靠 streak 决定"要不要用短超时探"，
+                # 而"空流/模型不支持"都不是"这个号吐不出首字节"
+                self._save_locked()
+                return
+            state.streak += 1
             seconds = self._cooldown(state.streak, kind)
             state.cooldown_until = (now + seconds) if seconds else 0.0
             self._save_locked()
@@ -385,12 +391,11 @@ class AccountPool:
     def _cooldown(self, streak: int, kind: str) -> float:
         """冷却多久。
 
-        - `empty`：不冷却。它回得很快，而且"空流"不能证明这个号废了。
         - `auth`：直接给上限 —— 凭据死了，等到天荒地老也不会自己好，只能重新登录（登录会触发 `_heal`）。
         - 连续失败到 `dry_after_fails`：也直接给上限，不再逐级爬 —— 上游的限流是按天的，
           逐级爬只会在"已经确定撞墙了"之后多试探好几次。
         """
-        if kind == "empty":
+        if kind in NO_COOLDOWN_KINDS:
             return 0.0
         if kind == "auth" or streak >= self.dry_after_fails:
             return self.max_cooldown
