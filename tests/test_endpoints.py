@@ -102,6 +102,15 @@ class StreamEndpointTest(EndpointFixture):
         self.assertIn('"content":"好"', response.text)
         self.assertIn('"finish_reason":"stop"', response.text)
         self.assertTrue(response.text.rstrip().endswith("data: [DONE]"))
+        # 收尾只能有一个：上游给了 stop 就不许再补一个（重复的终局 chunk 是纯噪声）
+        self.assertEqual(response.text.count('"finish_reason":"stop"'), 1)
+
+    def test_finish_reason_is_synthesized_when_upstream_omits_it(self):
+        """上游没给收尾时要补一个 —— 否则客户端会一直等一个永远不来的终局。"""
+        tail = {"role": "", "content": "", "reasoning": "", "tool_calls": None, "finish_reason": None}
+        self.install_pool([("A", "cn")], {"A": [delta("好"), tail]})
+        response = self.post(stream=True)
+        self.assertEqual(response.text.count('"finish_reason":"stop"'), 1)
 
     def test_failover_is_invisible_to_the_client(self):
         """★ A 挂死、B 正常 —— 客户端只该看到一份完整答案，外加台账里留下的痕迹。"""
@@ -183,6 +192,8 @@ class ObservabilityTest(EndpointFixture):
         self.assertIn("timeout", body["accounts"]["A"]["last_error"])
         self.assertFalse(body["accounts"]["B"]["cooling"])
         self.assertTrue(body["ready"], "冷却不影响 ready：那只是暂时的")
+        # 兼容字段要指向**能用的**那个：排第一的 A 正在冷却，报它等于误导
+        self.assertEqual(body["credentials"]["uid"], "uid-B")
 
     def test_health_without_key_hides_details(self):
         """配了 key 之后，不带 key 只能看到 ready（uid/姓名/冷却都不给）。
@@ -230,6 +241,11 @@ class ObservabilityTest(EndpointFixture):
         self.assertEqual(body["ledger"]["by_account"]["B"]["calls"], 1)
         self.assertEqual(body["ledger"]["by_account"]["A"]["errors"], 1)
         self.assertIn("B", body["session"]["by_account"])
+        # 合计得是真的：台账行里不写 total_tokens 的话这里会恒为 0
+        totals = body["ledger"]["totals"]
+        self.assertGreater(totals["total_tokens"], 0)
+        self.assertEqual(totals["total_tokens"], totals["prompt_tokens"] + totals["completion_tokens"])
+        self.assertIn("accounts", body)
 
 
 if __name__ == "__main__":

@@ -298,13 +298,17 @@ async def health(authorization: str | None = Header(default=None)) -> dict[str, 
     ready = any(row["problem"] is None for row in snapshot.values())
     if not authorized(authorization):
         return {"ready": ready}
+    # 向后兼容：老客户端读的是 `credentials` 这个单账号字段。指向**第一个能用的**账号 ——
+    # 排在第一位那个可能正好撞了上限在冷却，那时候报它反而是误导。
+    usable = [a for a in POOL.accounts
+              if snapshot[a.name]["problem"] is None and not snapshot[a.name]["cooling"]]
+    preferred = (usable or POOL.accounts)[0]
     body: dict[str, Any] = {
         "ready": ready,
         "region": REGION,
         "default_model": DEFAULT_MODEL,
         "models": MODELS,
-        # 向后兼容：老客户端读的是这个单账号字段，指向第一个账号
-        "credentials": snapshot[POOL.accounts[0].name]["credentials"],
+        "credentials": snapshot[preferred.name]["credentials"],
         "accounts": snapshot,
     }
     if not ready:
@@ -460,7 +464,9 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
         credits = up.get("credits")
         reason = _reasoning_tokens(up, str(message.get("reasoning_content") or ""))
         rec = {"ts": created, "model": model, "account": account, "stream": False,
-               "prompt_tokens": prompt, "completion_tokens": completion, "cached_tokens": hit,
+               "prompt_tokens": prompt, "completion_tokens": completion,
+               "total_tokens": prompt + completion,   # ★ 不写它 /stats 的合计就恒为 0
+               "cached_tokens": hit,
                "prompt_cache_miss_tokens": max(0, prompt - hit),
                "reasoning_tokens": reason,
                "credits": float(credits) if credits is not None else None,
@@ -497,6 +503,7 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
 
     async def event_stream() -> AsyncIterator[str]:
         emitted_role = False
+        saw_finish = False
         up: dict[str, Any] = {}          # 上游累计用量（收尾那条带）
         text_acc: list[str] = []
         reason_acc: list[str] = []
@@ -518,9 +525,14 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                     out["content"] = delta["content"]
                 if delta["tool_calls"]:
                     out["tool_calls"] = delta["tool_calls"]
+                if delta["finish_reason"]:
+                    saw_finish = True
                 if out or delta["finish_reason"]:
                     yield _chunk(completion_id, created, model, out, delta["finish_reason"])
-            yield _chunk(completion_id, created, model, {}, "stop")
+            if not saw_finish:
+                # 上游没给收尾就补一个 —— 但**别重复发**：上游给的收尾（上面那条）已经发过了，
+                # 再补一个客户端会看到两个 `stop`（纯噪声，也让"最后一个 chunk 才是终局"的假设失效）
+                yield _chunk(completion_id, created, model, {}, "stop")
 
             # ---- 记账：优先上游真数，缺哪格才估哪格 ----
             det = up.get("prompt_tokens_details") or {}
@@ -540,7 +552,9 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
             credits = up.get("credits")
             reason = _reasoning_tokens(up, "".join(reason_acc))
             rec = {"ts": created, "model": model, "account": account, "stream": True,
-                   "prompt_tokens": prompt, "completion_tokens": completion, "cached_tokens": hit,
+                   "prompt_tokens": prompt, "completion_tokens": completion,
+                   "total_tokens": prompt + completion,   # ★ 不写它 /stats 的合计就恒为 0
+                   "cached_tokens": hit,
                    "prompt_cache_miss_tokens": max(0, prompt - hit),
                    "reasoning_tokens": reason,
                    "credits": float(credits) if credits is not None else None,
@@ -584,17 +598,20 @@ def main() -> None:
         return
 
     auth = "需要 Bearer key" if API_KEY else "不校验 key（只监听本机时可用）"
-    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (region: {REGION}；默认模型: {DEFAULT_MODEL}；{auth})")
-    print(f"可用模型: {'、'.join(MODELS)}")
+    # ★ 全部 flush：这些行是打给"出事时的人"看的，stdout 一被重定向就是块缓冲，
+    #   不 flush 的话它们会卡在缓冲区里，等真要看的时候一个字都看不到
+    #   （systemd 那边有 PYTHONUNBUFFERED=1 兜着，手动重定向跑就没有）
+    print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (region: {REGION}；默认模型: {DEFAULT_MODEL}；{auth})", flush=True)
+    print(f"可用模型: {'、'.join(MODELS)}", flush=True)
     # 启动自检：账号配错了（路径写重、uid 是同一个登录、凭据缺失）在这里就说清楚，
     # 别等第一发请求挂在那儿才让人去猜
-    print(f"账号（按挑选顺序）: {'、'.join(f'{a.name}[{a.region}]' for a in POOL.accounts)}")
+    print(f"账号（按挑选顺序）: {'、'.join(f'{a.name}[{a.region}]' for a in POOL.accounts)}", flush=True)
     for warning in POOL.verify():
-        print(f"[账号池] 警告：{warning}")
+        print(f"[账号池] 警告：{warning}", flush=True)
     for name, row in POOL.snapshot().items():
         cooling = f"，冷却 {row['cooldown_seconds']}s（{row['last_error']}）" if row["cooling"] else ""
-        print(f"  - {name}: ok={row['ok']} fails={row['fails']}{cooling}")
-    print(f"状态文件: {ACCOUNT_STATE_PATH}")
+        print(f"  - {name}: ok={row['ok']} fails={row['fails']}{cooling}", flush=True)
+    print(f"状态文件: {ACCOUNT_STATE_PATH}", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
