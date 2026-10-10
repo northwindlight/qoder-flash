@@ -24,22 +24,19 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 
-from qoder import (
-    DEFAULT_MODEL,
-    DEFAULT_REGION,
-    REGION_MODELS,
-    Credentials,
-    QoderError,
-    complete_chat,
-    credential_summary,
-    load_credentials,
-    resolve_model_key,
-    resolve_region,
-    stream_chat,
+from accounts import AccountPool, build_pool
+from failover import (
+    AllAccountsFailed,
+    Attempt,
+    complete_with_failover,
+    drain,
+    open_stream,
 )
+from qoder import DEFAULT_MODEL, QoderError, resolve_model_key
 
 app = FastAPI(title="Qoder Flash Gateway", version="0.1.0")
 
@@ -84,9 +81,21 @@ def write_api_key(key: str) -> None:
     CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     CONFIG_PATH.chmod(0o600)
 
-# 对外报的模型名：跟随 region 决定（国际版免费号只有 2 个，CN 号有一整套）。
-REGION = str(CONFIG.get("region") or DEFAULT_REGION).strip().lower()
-MODELS = REGION_MODELS.get(REGION, [DEFAULT_MODEL])
+# 账号池状态（冷却/失败计数）落盘位置：撞了上限的账号要冷却几十分钟，
+# 进程一重启就忘掉的话，第一发请求又要白等它超时一次。
+ACCOUNT_STATE_PATH = Path(
+    os.getenv("QODER_ACCOUNT_STATE") or (Path(__file__).with_name("account-state.json"))
+)
+
+# ★ 多账号：`config.json` 里的 `accounts` 有几个就是几个。没配的话
+#   `build_pool` 会拿 `region` 合成一个 —— 与改造前的单区行为完全一致。
+POOL: AccountPool = build_pool(CONFIG, state_path=ACCOUNT_STATE_PATH)
+
+# 对外报的模型名 = 各账号模型表的**并集**（同一个模型名可能只有部分账号能用，
+# 真正发不发得出去由挑选阶段按账号的 region 判）。
+MODELS = POOL.all_models() or [DEFAULT_MODEL]
+# 向后兼容：老客户端会读 `/health` 的 `region`。配了 accounts 就以第一个账号为准。
+REGION = str(CONFIG.get("region") or POOL.accounts[0].region).strip().lower()
 SYSTEM_FINGERPRINT = "qoder-flash-gateway"
 
 # Qoder 侧的思考强度档位（DeepSeek 的 low/medium/high 都落在这个集合里）
@@ -121,11 +130,19 @@ def check_api_key(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def get_credentials() -> Credentials:
-    try:
-        return load_credentials(region=REGION)
-    except QoderError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+def any_account_supports(model: str) -> bool:
+    """有没有任何一个账号发得了这个模型。
+
+    没有的话是**客户端的错**（400），不是上游的错（502）—— 别让"模型名写错了"
+    看起来像"服务挂了"。
+    """
+    return any(acct.supports(model) for acct in POOL.accounts)
+
+
+def accounts_problem() -> str:
+    """一个账号都用不了时，拼一句能读的原因出来。"""
+    reasons = POOL.skip_reasons()
+    return "；".join(f"{name}: {text}" for name, text in reasons.items()) or "没有配置任何账号"
 
 
 # ★ 用量台账：每完成一次调用追加一行 JSONL，并把累计值给 /stats。
@@ -136,28 +153,58 @@ LEDGER_PATH = Path(os.getenv("QODER_LEDGER") or (Path(__file__).with_name("usage
 
 # 进程内累计（不读盘，给 /stats 的 session 段）。uvicorn 单进程跑，锁只是防并发请求。
 _USAGE_LOCK = threading.Lock()
-_USAGE: dict[str, dict[str, Any]] = {}
+_USAGE: dict[str, dict[str, Any]] = {}          # 按模型（老口径）
+_USAGE_ACCOUNT: dict[str, dict[str, Any]] = {}  # 按账号（多账号之后才有的口径）
 
 
-def _accumulate(model: str, rec: dict[str, Any]) -> None:
-    with _USAGE_LOCK:
-        slot = _USAGE.setdefault(str(model or "?"), {
-            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-            "total_tokens": 0, "cached_tokens": 0, "reasoning_tokens": 0,
-            "credits": 0.0, "errors": 0})
-        slot["calls"] += 1
-        if rec.get("error"):
-            slot["errors"] += 1
-        for k in ("prompt_tokens", "completion_tokens", "total_tokens",
-                  "cached_tokens", "reasoning_tokens"):
-            try:
-                slot[k] += int(rec.get(k) or 0)
-            except (TypeError, ValueError):
-                pass
+def _blank_usage() -> dict[str, Any]:
+    return {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "reasoning_tokens": 0, "credits": 0.0, "errors": 0}
+
+
+def _fold_into(target: dict[str, dict[str, Any]], key: str, rec: dict[str, Any]) -> None:
+    """把一条台账记录累加进 `target[key]`。会话内累计与台账全量重算共用这一份。"""
+    slot = target.setdefault(str(key or "?"), _blank_usage())
+    slot["calls"] += 1
+    if rec.get("error"):
+        slot["errors"] += 1
+    for k in ("prompt_tokens", "completion_tokens", "total_tokens",
+              "cached_tokens", "reasoning_tokens"):
         try:
-            slot["credits"] += float(rec.get("credits") or 0.0)
+            slot[k] += int(rec.get(k) or 0)
         except (TypeError, ValueError):
             pass
+    try:
+        slot["credits"] += float(rec.get("credits") or 0.0)
+    except (TypeError, ValueError):
+        pass
+
+
+def _accumulate(model: str, account: str | None, rec: dict[str, Any]) -> None:
+    """一次调用同时记进"按模型"和"按账号"两个口径。"""
+    with _USAGE_LOCK:
+        _fold_into(_USAGE, str(model or "?"), rec)
+        _fold_into(_USAGE_ACCOUNT, str(account or "?"), rec)
+
+
+def _group(rows: list[dict[str, Any]], field: str) -> dict[str, dict[str, Any]]:
+    """把台账行按某个字段分组。老行没有 `account` 字段 → 归到 `"?"`。"""
+    acc: dict[str, dict[str, Any]] = {}
+    for rec in rows:
+        _fold_into(acc, str(rec.get(field) or "?"), rec)
+    return acc
+
+
+def _record_attempts(created: int, model: str, stream: bool, attempts: list[Attempt]) -> None:
+    """把"试过但失败的账号"也记进台账。
+
+    只记成功那一次的话，按账号根本看不出抖动来 —— 换了哪个号在顶、为什么换，
+    都得在台账里留痕。
+    """
+    for attempt in attempts:
+        _accumulate(model, attempt.account, {"error": 1})
+        _write_ledger({"ts": created, "model": model, "account": attempt.account, "stream": stream,
+                       "error": f"{attempt.kind}: {attempt.detail}"[:200]})
 
 
 def usage_payload(prompt: int = 0, completion: int = 0, hit: int = 0, miss: int | None = None,
@@ -241,20 +288,28 @@ def _read_ledger(limit: int = 200000) -> list[dict[str, Any]]:
 
 @app.get("/health")
 async def health(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    """探活不需要 key；但账号详情（uid/姓名/是否过期）只给带 key 的人看。"""
-    try:
-        cred = load_credentials(region=REGION)
-    except QoderError as exc:
-        return {"ready": False, "error": str(exc)} if authorized(authorization) else {"ready": False}
+    """探活不需要 key；但账号详情（uid/姓名/是否过期/冷却）只给带 key 的人看。
+
+    `ready` 的口径**刻意不含冷却**：它只回答"本地凭据配好且没过期吗"。
+    一个账号撞了每日上限是**暂时**的，把它算成"没就绪"会让客户端直接放弃，
+    而冷却情况已经在 `accounts[*].cooling` 里如实报出来了。
+    """
+    snapshot = POOL.snapshot()
+    ready = any(row["problem"] is None for row in snapshot.values())
     if not authorized(authorization):
-        return {"ready": True}
-    return {
-        "ready": True,
+        return {"ready": ready}
+    body: dict[str, Any] = {
+        "ready": ready,
         "region": REGION,
         "default_model": DEFAULT_MODEL,
         "models": MODELS,
-        "credentials": credential_summary(cred),
+        # 向后兼容：老客户端读的是这个单账号字段，指向第一个账号
+        "credentials": snapshot[POOL.accounts[0].name]["credentials"],
+        "accounts": snapshot,
     }
+    if not ready:
+        body["error"] = accounts_problem()
+    return body
 
 
 @app.get("/models")
@@ -284,40 +339,20 @@ async def stats(authorization: str | None = Header(default=None)) -> dict[str, A
     """累计用量台账（进程内累计 + 落盘 JSONL 的全量重算）。
 
     `ledger` 是**全量**（跨重启），`calls`/`totals` 是本次进程启动以来的。
-    按模型分组，附命中率与 credits 合计——"这一局花了多少"就看这里。
+    按模型和**按账号**两个口径都有：多账号之后"哪个号在供、各花了多少"就靠 `by_account`。
+    老台账行没有 `account` 字段，归到 `"?"`。
     """
     check_api_key(authorization)
 
-    def _blank() -> dict[str, Any]:
-        return {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-                "cached_tokens": 0, "reasoning_tokens": 0, "credits": 0.0, "errors": 0}
-
-    def _fold(acc: dict[str, dict[str, Any]], rows: list[dict[str, Any]]) -> dict[str, Any]:
-        for rec in rows:
-            model = str(rec.get("model") or "?")
-            slot = acc.setdefault(model, _blank())
-            slot["calls"] += 1
-            if rec.get("error"):
-                slot["errors"] += 1
-            for src, dst in (("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"),
-                             ("total_tokens", "total_tokens"), ("cached_tokens", "cached_tokens"),
-                             ("reasoning_tokens", "reasoning_tokens")):
-                try:
-                    slot[dst] += int(rec.get(src) or 0)
-                except (TypeError, ValueError):
-                    pass
-            try:
-                slot["credits"] += float(rec.get("credits") or 0.0)
-            except (TypeError, ValueError):
-                pass
-        return acc
-
     with _USAGE_LOCK:
-        session = {k: dict(v) for k, v in _USAGE.items()}
-    ledger = _fold({}, _read_ledger())
+        session_model = {k: dict(v) for k, v in _USAGE.items()}
+        session_account = {k: dict(v) for k, v in _USAGE_ACCOUNT.items()}
+    rows = _read_ledger()
+    ledger_model = _group(rows, "model")
+    ledger_account = _group(rows, "account")
 
     def _finish(acc: dict[str, dict[str, Any]]) -> dict[str, Any]:
-        grand = _blank()
+        grand = _blank_usage()
         for slot in acc.values():
             for k in grand:
                 grand[k] += slot[k]
@@ -327,11 +362,32 @@ async def stats(authorization: str | None = Header(default=None)) -> dict[str, A
             inp = slot["prompt_tokens"]
             slot["cache_hit_rate"] = round(slot["cached_tokens"] / inp, 4) if inp else None
         grand["cache_hit_rate"] = round(grand["cached_tokens"] / grand["prompt_tokens"], 4) if grand["prompt_tokens"] else None
-        return {"by_model": acc, "totals": grand}
+        return {"totals": grand}
 
     return {"ledger_path": str(LEDGER_PATH),
-            "session": {"by_model": session, **_finish(session)},
-            "ledger": {"by_model": ledger, **_finish(ledger)}}
+            "state_path": str(ACCOUNT_STATE_PATH),
+            "accounts": POOL.snapshot(),
+            "session": {"by_model": session_model, "by_account": session_account,
+                        **_finish(session_model)},
+            "ledger": {"by_model": ledger_model, "by_account": ledger_account,
+                       **_finish(ledger_model)}}
+
+
+@app.post("/admin/accounts/reset")
+@app.post("/admin/accounts/{name}/reset")
+async def reset_accounts(name: str | None = None,
+                         authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """手动解冻账号（你觉得上游该重置了 / 刚重新登录过 / 刚改完配置）。
+
+    没有它就只能重启服务 —— 而重启会把没落盘的东西一起丢掉，没必要。
+    `name` 不填就是全部解冻。
+    """
+    check_api_key(authorization)
+    names = [a.name for a in POOL.accounts]
+    if name is not None and name not in names:
+        raise HTTPException(status_code=404,
+                            detail=f"没有这个账号：{name}；现有：{'、'.join(names)}")
+    return {"cleared": POOL.clear_cooldown(name), "accounts": POOL.snapshot()}
 
 
 def _chunk(completion_id: str, created: int, model: str, delta: dict[str, Any] | None = None, finish_reason: str | None = None, usage: dict[str, int] | None = None, choices: list[Any] | None = None) -> str:
@@ -352,7 +408,6 @@ def _chunk(completion_id: str, created: int, model: str, delta: dict[str, Any] |
 @app.post("/v1/chat/completions")
 async def chat_completions(payload: dict[str, Any], authorization: str | None = Header(default=None)):
     check_api_key(authorization)
-    cred = get_credentials()
 
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
     if not messages:
@@ -361,28 +416,39 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     effort = resolve_effort(payload)
     model = str(payload.get("model") or DEFAULT_MODEL)
     try:
-        model_key = resolve_model_key(model, REGION)
+        resolve_model_key(model, REGION)   # 只做"认不认识这个名字"的校验（换算口径只有这一处）
     except QoderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not any_account_supports(model):
+        # 名字认得出、但没有任何账号发得了 —— 同样是**客户端的错**，别报成 502
+        raise HTTPException(status_code=400, detail=(
+            f"没有账号能发 {model!r}；当前可用模型：{'、'.join(MODELS)}"))
     completion_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
 
     if not payload.get("stream"):
         try:
-            message = await complete_chat(
-                messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
+            message, handle = await complete_with_failover(
+                POOL, messages, tools, model=model, effort=effort
             )
-        except QoderError as exc:
-            _accumulate(model, {"error": 1})
-            _write_ledger({"ts": created, "model": model, "stream": False, "error": str(exc)[:200]})
+        except AllAccountsFailed as exc:
+            _record_attempts(created, model, False, exc.attempts)
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        # ★ `usage` 是 qoder.complete_chat 顺手带回来的上游真数，取走后别留在 message 里
+        except (QoderError, httpx.HTTPError, OSError) as exc:
+            # 首块已经吐过之后才断的流：**不重试**（重来会拼出前后矛盾的垃圾），如实报错。
+            # 顺带补掉改造前那个裸 500：RemoteProtocolError 不是 QoderError，原来会穿透成 traceback
+            _accumulate(model, "?", {"error": 1})
+            _write_ledger({"ts": created, "model": model, "stream": False, "error": str(exc)[:200]})
+            raise HTTPException(status_code=502, detail=f"上游流中途断开（已产出部分内容，不重试）：{exc}") from exc
+        account = handle.account
+        _record_attempts(created, model, False, handle.attempts)
+        # ★ `usage` 是拼装时顺手带回来的上游真数，取走后别留在 message 里
         up = message.pop("usage", None) or {}
         det = up.get("prompt_tokens_details") or {}
         prompt = int(up.get("prompt_tokens") or 0)
         completion = int(up.get("completion_tokens") or 0)
         hit = int(det.get("cached_tokens") or 0)
-        if not prompt:                       # 上游没报 ⇒ 估，并如实记 estimated
+        if not prompt:                       # 上游没报 ⇒ 估，并如实记 reported=False
             prompt = sum(_est_tokens(m.get("content")) for m in messages if isinstance(m, dict))
             for m in messages:
                 if isinstance(m, dict):
@@ -393,13 +459,13 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
             completion = _est_tokens(message.get("content")) + _est_tokens(message.get("reasoning_content"))
         credits = up.get("credits")
         reason = _reasoning_tokens(up, str(message.get("reasoning_content") or ""))
-        rec = {"ts": created, "model": model, "stream": False, "prompt_tokens": prompt,
-               "completion_tokens": completion, "cached_tokens": hit,
+        rec = {"ts": created, "model": model, "account": account, "stream": False,
+               "prompt_tokens": prompt, "completion_tokens": completion, "cached_tokens": hit,
                "prompt_cache_miss_tokens": max(0, prompt - hit),
                "reasoning_tokens": reason,
                "credits": float(credits) if credits is not None else None,
                "reported": bool(up)}
-        _accumulate(model, rec)
+        _accumulate(model, account, rec)
         _write_ledger(rec)
         return {
             "id": completion_id,
@@ -419,24 +485,29 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
 
     include_usage = bool((payload.get("stream_options") or {}).get("include_usage"))
 
+    try:
+        # ★ 先把首块 prime 出来再返回响应：全账号都挂的时候这里就抛了 → 回一个正经的
+        #   502 JSON，而不是"200 的 SSE 立刻报错"（后者多数 SDK 会当成一次成功但内容为空的调用）
+        handle = await open_stream(POOL, messages, tools, model=model, effort=effort)
+    except AllAccountsFailed as exc:
+        _record_attempts(created, model, True, exc.attempts)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    account = handle.account
+    _record_attempts(created, model, True, handle.attempts)
+
     async def event_stream() -> AsyncIterator[str]:
         emitted_role = False
         up: dict[str, Any] = {}          # 上游累计用量（收尾那条带）
         text_acc: list[str] = []
         reason_acc: list[str] = []
-        tool_acc: list[str] = []
         try:
-            async for delta in stream_chat(
-                messages, tools, cred, reasoning_effort=effort, region=REGION, model_key=model_key
-            ):
+            async for delta in drain(handle):     # drain 会把 prime 出来的首块一起吐出来
                 if delta.get("usage"):   # 只带用量的收尾 delta：不进 choices，只留着记账
                     up = delta["usage"]
                 if delta["reasoning"]:
                     reason_acc.append(delta["reasoning"])
                 if delta["content"]:
                     text_acc.append(delta["content"])
-                for tc in (delta["tool_calls"] or []):
-                    tool_acc.append(str(((tc or {}).get("function") or {}).get("arguments") or ""))
                 out: dict[str, Any] = {}
                 if not emitted_role:
                     out["role"] = "assistant"
@@ -468,13 +539,13 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 completion = _est_tokens("".join(text_acc)) + _est_tokens("".join(reason_acc))
             credits = up.get("credits")
             reason = _reasoning_tokens(up, "".join(reason_acc))
-            rec = {"ts": created, "model": model, "stream": True, "prompt_tokens": prompt,
-                   "completion_tokens": completion, "cached_tokens": hit,
+            rec = {"ts": created, "model": model, "account": account, "stream": True,
+                   "prompt_tokens": prompt, "completion_tokens": completion, "cached_tokens": hit,
                    "prompt_cache_miss_tokens": max(0, prompt - hit),
                    "reasoning_tokens": reason,
                    "credits": float(credits) if credits is not None else None,
                    "reported": bool(up), "wall": round(time.time() - created, 3)}
-            _accumulate(model, rec)
+            _accumulate(model, account, rec)
             _write_ledger(rec)
 
             if include_usage:
@@ -482,10 +553,15 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 yield _chunk(completion_id, created, model,
                              usage=usage_payload(prompt, completion, hit, credits=credits,
                                                  reasoning=reason), choices=[])
-        except QoderError as exc:
-            _accumulate(model, {"error": 1})
-            _write_ledger({"ts": created, "model": model, "stream": True, "error": str(exc)[:200]})
+        except (QoderError, httpx.HTTPError, OSError) as exc:
+            # ★ 首块已经吐过 ⇒ **不换账号**（换个号从头再来会把两段答案拼在一起）。
+            #   而且**不发 [DONE]**：多数 SDK 把 [DONE] 当正常收尾，会把半截答案当完整答案
+            #   —— 那比直接报错更坑。这里只发一个错误帧就断流，让 SDK 自己认出这是断的。
+            _accumulate(model, account, {"error": 1})
+            _write_ledger({"ts": created, "model": model, "account": account, "stream": True,
+                           "error": str(exc)[:200]})
             yield f"data: {json.dumps({'error': {'message': str(exc), 'type': 'upstream_error'}}, ensure_ascii=False)}\n\n"
+            return
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -510,6 +586,15 @@ def main() -> None:
     auth = "需要 Bearer key" if API_KEY else "不校验 key（只监听本机时可用）"
     print(f"Qoder Flash Gateway -> http://{args.host}:{args.port}  (region: {REGION}；默认模型: {DEFAULT_MODEL}；{auth})")
     print(f"可用模型: {'、'.join(MODELS)}")
+    # 启动自检：账号配错了（路径写重、uid 是同一个登录、凭据缺失）在这里就说清楚，
+    # 别等第一发请求挂在那儿才让人去猜
+    print(f"账号（按挑选顺序）: {'、'.join(f'{a.name}[{a.region}]' for a in POOL.accounts)}")
+    for warning in POOL.verify():
+        print(f"[账号池] 警告：{warning}")
+    for name, row in POOL.snapshot().items():
+        cooling = f"，冷却 {row['cooldown_seconds']}s（{row['last_error']}）" if row["cooling"] else ""
+        print(f"  - {name}: ok={row['ok']} fails={row['fails']}{cooling}")
+    print(f"状态文件: {ACCOUNT_STATE_PATH}")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

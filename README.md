@@ -135,9 +135,64 @@ python main.py --gen-key      # 生成/轮换 key 写入 config.json（600），
 `/health` 不需要 key（探活用，只回 `{"ready":true}`）；**账号详情**（region/模型表/uid/姓名/是否过期）
 要带对 key。
 
+### 多账号（`accounts`）
+
+配了 `accounts` 就有几个账号用几个，一个撞墙自动换下一个。**不配就还是单区**，行为与以前完全一样。
+
+```json
+{
+  "api_key": "qf-...",
+  "accounts": [
+    {"name": "cn-main", "region": "cn",   "config_dir": "~/.qoder-cn"},
+    {"name": "cn-old",  "region": "cn",   "config_dir": "~/.qoder-accounts/cn-old"},
+    {"name": "intl",    "region": "intl", "config_dir": "~/.qoder"}
+  ],
+  "failover": {"first_byte_timeout": 30, "max_cooldown": 1800}
+}
+```
+
+一个账号 = 一个配置目录（凭据在它下面的 `.auth/`）。**「一个账号一个目录」和 CLI 自己是同一件事**，
+所以第二个账号这么登，互不影响：
+
+```bash
+QODERCN_CONFIG_DIR=$HOME/.qoder-accounts/cn-old qoderclicn login
+# 等价： qoderclicn --config-dir ~/.qoder-accounts/cn-old login
+# 顺手看一眼这个号能用哪些模型，填进上面的 models 字段：
+QODERCN_CONFIG_DIR=$HOME/.qoder-accounts/cn-old qoderclicn --list-models
+```
+
+| 键（`failover`） | 默认 | 说明 |
+|---|---|---|
+| `first_byte_timeout` | `30` | 首字节超时（秒）。健康账号实测 0.9 秒，挂掉时 45~90 秒不吐字节 |
+| `suspect_timeout` | `10` | 已经失败过的账号改用这个短超时再探（0.9 秒 ≪ 10 秒，不会误杀） |
+| `cooldown_base` | `120` | 第一次失败冷却多久（秒） |
+| `max_cooldown` | `1800` | 冷却上限（秒）。连续失败到 `dry_after_fails` 次就直接给上限 |
+| `dry_after_fails` | `2` | 连续失败几次算"这个号今天废了" |
+| `total_budget` | `45` | 一次请求在所有账号上总共最多耗多久（秒），防止把客户端的读超时串爆 |
+
+每个账号还能加 `models: [...]` 覆盖 region 默认的模型表（比如国际版免费号只有 Flash）。
+
+判活**不看状态码**，看的是"首字节来没来 / 流有没有被掐断"——原因见
+[已知限制](#已知限制) 里的第一条。挂了就进冷却，成功就清零；`.auth/user` 被重写过
+（= 重新登录过）会自动清掉失败记录，不用重启。
+
+观测：`/health` 有每个账号的 uid/是否过期/冷却到几点/最近错误，`/stats` 的 `by_account`
+看每个号各花了多少，台账每行都带 `account`。手动解冻（觉得上游该重置了）：
+
+```bash
+curl -X POST http://127.0.0.1:5050/admin/accounts/reset -H "Authorization: Bearer <key>"          # 全部
+curl -X POST http://127.0.0.1:5050/admin/accounts/cn-old/reset -H "Authorization: Bearer <key>"    # 指定一个
+```
+
 ## 已知限制
 
-- **`usage` 恒为 0**：老版响应里没有可用计数，客户端要自己估 token。
+- **撞了每日请求上限时，上游不报错，只是"静默挂死"**：它照样回 `200 OK` 加响应头（实测 0.4 秒），
+  然后**一个字节都不发**，直到约 60 秒被对端掐断（`RemoteProtocolError`）。所以**别用状态码判活**。
+  另外 credits 没烧完也会撞这个上限，且上游不提示。多账号的自动切换就是冲着它做的（见上文）。
+- **自动切换的收益被客户端的读超时封顶**：一次请求里第一个账号的失败要等满 `first_byte_timeout`
+  才会换下一个。多数 SDK 的默认读超时是 60 秒，所以 `total_budget` 默认压到 45 秒 ——
+  两个账号都是新鲜的挂账号时，客户端可能在切换完成前就先超时了。想再快只能调小
+  `first_byte_timeout`，但那会开始误杀正常的慢请求。
 - **不做 token 自动刷新**：过期后（`/health` 的 `token_expired: true`）重新登录一次即可。
   刻意不刷新是因为刷新会轮换掉 CLI 自己那份凭据，把 CLI 弄掉线。
 - **GLM 会把思考混进正文**：`glm-5.3` 的思考过程直接写在 `content` 里（不是 `reasoning_content`），

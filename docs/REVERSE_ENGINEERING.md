@@ -366,5 +366,46 @@ Qoder 换个版本、改个协议，上面这套可能要重跑。顺序是固�
 
 - 凭据是 `qodercli login` 你自己登出来的，本程序**只读不写**，也不做 token 刷新
   （刷新会轮换掉 CLI 自己那份凭据，把 CLI 弄掉线）。
-- 不做批量注册、不做多账号轮换、不绕过额度。使用的是账号本来就能免费用到的模型。
+- 不做批量注册、不做注册机。多账号切换用的是**本人的多个实名账号**，每个号自己的上限照旧 ——
+  那是"这个号今天用满了换那个号"，不是把某个号的上限撬开。
 - 用的是官方 CLI 自己的协议行为，不是伪造客户端身份。
+
+---
+
+## 10. 多账号：CLI 的配置目录可以被重定向
+
+要同时登两个账号，关键是**别让第二次登录覆盖第一次的凭据**。CLI 的配置目录（凭据就在它下面的
+`.auth/`）是可以整体改掉的，两条路都实测有效：
+
+```bash
+QODERCN_CONFIG_DIR=$HOME/.qoder-accounts/cn-old qoderclicn login   # 环境变量
+qoderclicn --config-dir $HOME/.qoder-accounts/cn-old login         # 官方 flag（--help 里有）
+```
+
+**怎么确认它真的生效**：把配置目录指到一个空目录，CLI 会建出整套骨架（`installation_id`、
+`.cache/`、`tmp/`、**`.auth/`**）并报 `Not logged in · Please run /login`。
+如果它反而报的是账号相关的话（比如"credit usage limit"），说明**没生效**、它读的还是老目录 ——
+这个判据比"命令没报错"可靠得多。
+
+### 环境变量名随站点变，别猜
+
+bundle 里（`qodercli.js`）相关的地方：
+
+```js
+gm = Ni ? "QODERCN_" : "QODER_"        // Ni = 站点是否是 cn
+vqA = _n("CONFIG_DIR")                 // _n(A) = `${gm}${A}`
+TqA = _n("CLI_HOME")                   // 兜底：CLI_HOME 是**上级目录**，会再拼 ".qoder[-cn]"
+qI  = Ni ? ".qoder-cn" : ".qoder"      // 配置目录名（Vor.userConfigDirName）
+```
+
+配置目录的解析顺序（`Mr()`）：`globalThis[Symbol.for("qoder.configHomeDirOverride")]`（SDK 用）
+→ `env[CONFIG_DIR]` → `env[CLI_HOME] || homedir()` 再拼 `.qoder[-cn]`。
+凭据目录是 `join(Mr(), ".auth")`（`machine_id`、`user` 就在里面）。
+
+所以**前缀跟着站点走**：CN 版是 `QODERCN_CONFIG_DIR` / `QODERCN_CLI_HOME`，
+国际版是 `QODER_CONFIG_DIR` / `QODER_CLI_HOME`。实测踩的坑：拿 npm 那个 `qodercli`（国际版站点）
+配 `QODERCN_CLI_HOME` 是**完全无效**的 —— 它不报错、也不建目录，只是照旧读 `~/.qoder`，
+让人误以为"这个变量没用"。**认错变量名会得到"静默无效"，这就是为什么上面那条判据必须用**。
+
+登录态落在哪个目录，`~/.qoder-cn/.auth/user` 里就是哪份凭据（解密方法见第 6 章）；
+本程序据此支持"多账号 = 多配置目录"，见 README 的「多账号」一节。
