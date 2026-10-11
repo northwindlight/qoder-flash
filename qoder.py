@@ -280,6 +280,37 @@ def _text_of(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def _images_of(content: Any) -> list[dict[str, Any]]:
+    """从 OpenAI 的 content 里挑出**图片块**，原样带走（`_text_of` 只认文本）。
+
+    ★★ 2026-10-12：图片以前在这里**被无声丢掉**——`_text_of` 对非 text 段两个分支都不进，
+      于是发图给模型，模型回「您没有提供具体的图片」，而 HTTP 是 **200**、用量照报，
+      一点异常都没有（用户口径：这类静默失效最贵）。
+
+    ★ 形状**不用猜、也不用 `imageUrls`**：上游认的就是 OpenAI/DeepSeek 那套块数组，
+      图放在 **user 消息的 `contents`** 里，与文本并排。实测（400×400 探针图，
+      问「红格在第几列第几行、里面什么字」）：
+
+        is_vl=False, 无图     → 「我无法看到您提到的图片」  prompt_tokens=104
+        is_vl=True,  B_contents → 「4,2,柒」                prompt_tokens=250
+
+      ⇒ 只差两样：**`is_vl` 要开**（见 `build_body`）、**块数组别拍平**（就是这里）。
+      `chat_context.imageUrls` / 顶层 `image_urls` 那两个空字段**不用填**——
+      它们是抄真客户端请求时带过来的，实测留空照样看得见。
+
+    只认 `image_url`：本网关说的是 chat completions，Responses 那套 `input_image` 没测过，
+    不猜、不加（猜形状正是本仓库 §3.1 那条死路）。
+    """
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "image_url" \
+                and isinstance(item.get("image_url"), dict):
+            out.append({"type": "image_url", "image_url": item["image_url"]})
+    return out
+
+
 def _convert_message(message: dict[str, Any], has_tools: bool = False) -> dict[str, Any] | None:
     """OpenAI 消息 → 老版端点的消息。
 
@@ -302,12 +333,17 @@ def _convert_message(message: dict[str, Any], has_tools: bool = False) -> dict[s
         role = "user"
 
     if role == "user":
-        if not text.strip():
+        # ★ 图片与文本**并排**放进 `contents`（文本在前，与实测过的形状一致）；
+        #   `_text_of` 照旧只管文本，图片由 `_images_of` 带过来（2026-10-12）。
+        #   原先的 `if not text.strip(): return None` 会把「只有图没字」的消息整条丢掉，
+        #   所以放行条件加上 images。
+        images = _images_of(message.get("content"))
+        if not text.strip() and not images:
             return None
         return {
             "role": "user",
             "content": "",
-            "contents": [{"type": "text", "text": text}],
+            "contents": [{"type": "text", "text": text}] + images,
             "response_meta": _response_meta(),
             "reasoning_content_signature": "",
         }
@@ -349,6 +385,15 @@ def build_body(
     """拼出老版端点的请求体（字段名照服务端要求，不能随意增删）。model_key 必须是 Qoder 的 key。"""
     has_tools = bool(tools)
     converted = [m for m in (_convert_message(m, has_tools) for m in messages) if m]
+    # ★ 本次请求带没带图 —— 决定模型配置里的 `is_vl`（2026-10-12）。
+    #   实测：不发图时 `is_vl` 开着也正常，但**不带图就别开**——这是模型选择/路由的
+    #   输入之一，无谓地翻转它等于每次纯文本请求都换一个模型跑（本仓库最贵的教训
+    #   就是「模型换了自己不说」）。所以按请求真有没有图来定，不写死。
+    has_image = any(
+        isinstance(b, dict) and b.get("type") == "image_url"
+        for m in converted
+        for b in (m.get("contents") or [])
+    )
     prompt = ""
     for message in reversed(converted):
         if message["role"] == "user":
@@ -393,7 +438,10 @@ def build_body(
             "display_name": model_key,
             "model": "",
             "format": "openai",
-            "is_vl": False,
+            # ★ 视觉开关：**由本次请求真有没有图决定**（2026-10-12）。
+            #   原先写死 False ⇒ 图就算塞进 contents 上游也不启用视觉，模型回
+            #   「我无法看到您提到的图片」而 HTTP 是 200（静默失效）。
+            "is_vl": has_image,
             "is_reasoning": reasoning_effort != "none",
             "api_key": "",
             "url": "",
