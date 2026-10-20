@@ -552,6 +552,31 @@ async def stream_chat(
                     yield delta
 
 
+def ensure_tool_ids(fragments: list[dict[str, Any]], assigned: dict[int, str],
+                    used: set[str]) -> list[dict[str, Any]]:
+    """保证每个 tool_call 的 id 非空且全批唯一。
+
+    上游的后续分片会带 `id: ""`（正常，首片有 id），但偶尔首片也没有 id，
+    或两批复用同一个 id；客户端（战国）按"非空且唯一"校验后会直接终止整局。
+    id 只是提供方私有标识，这里补 `call_<hex>` 不影响语义。
+    """
+    out: list[dict[str, Any]] = []
+    for fragment in fragments:
+        frag = dict(fragment)
+        index = frag.get("index", 0)
+        ident = frag.get("id")
+        if ident and ident not in used:
+            assigned[index] = str(ident)
+            used.add(str(ident))
+        elif index not in assigned:
+            ident = f"call_{uuid.uuid4().hex[:24]}"
+            assigned[index] = ident
+            used.add(ident)
+        frag["id"] = assigned[index]
+        out.append(frag)
+    return out
+
+
 def merge_tool_calls(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """把工具调用碎片拼回完整调用。
 
@@ -576,6 +601,13 @@ def merge_tool_calls(fragments: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if name and not merged[-1]["function"]["name"]:
             merged[-1]["function"]["name"] = name
         merged[-1]["function"]["arguments"] += arguments
+    used: set[str] = set()
+    for call in merged:
+        ident = str(call.get("id") or "")
+        if not ident or ident in used:
+            ident = f"call_{uuid.uuid4().hex[:24]}"
+        call["id"] = ident
+        used.add(ident)
     return merged
 
 

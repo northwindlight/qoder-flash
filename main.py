@@ -36,7 +36,7 @@ from failover import (
     drain,
     open_stream,
 )
-from qoder import DEFAULT_MODEL, QoderError, resolve_model_key
+from qoder import DEFAULT_MODEL, QoderError, ensure_tool_ids, resolve_model_key
 
 app = FastAPI(title="Qoder Flash Gateway", version="0.1.0")
 
@@ -504,6 +504,8 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
     async def event_stream() -> AsyncIterator[str]:
         emitted_role = False
         saw_finish = False
+        tool_ids: dict[int, str] = {}
+        used_tool_ids: set[str] = set()
         up: dict[str, Any] = {}          # 上游累计用量（收尾那条带）
         text_acc: list[str] = []
         reason_acc: list[str] = []
@@ -524,7 +526,7 @@ async def chat_completions(payload: dict[str, Any], authorization: str | None = 
                 if delta["content"]:
                     out["content"] = delta["content"]
                 if delta["tool_calls"]:
-                    out["tool_calls"] = delta["tool_calls"]
+                    out["tool_calls"] = ensure_tool_ids(delta["tool_calls"], tool_ids, used_tool_ids)
                 if delta["finish_reason"]:
                     saw_finish = True
                 if out or delta["finish_reason"]:
