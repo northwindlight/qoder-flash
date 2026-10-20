@@ -65,13 +65,15 @@ MODEL_KEYS: dict[str, str] = {
     "qwen": "qmodel",
     "glm-5.3": "gmodel",
     "deepseek-v4-pro": "dmodel",
+    "deepseek-flash": "dfmodel",
     "kimi-k3": "kmodel_latest",
 }
 
 # 两个区能用的模型不一样：国际版那个免费号只有两个，且 Max 会挂（请求不返回直接超时）
 REGION_MODELS: dict[str, list[str]] = {
-    "intl": ["qwen3.8-flash", "qwen3.8-max"],
-    "cn": ["auto", "qwen3.8-flash", "qwen3.8-max", "qwen", "glm-5.3", "deepseek-v4-pro", "kimi-k3"],
+    "intl": ["qwen3.8-flash", "qwen3.8-max", "deepseek-flash"],
+    "cn": ["auto", "qwen3.8-flash", "qwen3.8-max", "qwen", "glm-5.3",
+           "deepseek-v4-pro", "deepseek-flash", "kimi-k3"],
 }
 
 DEFAULT_MODEL = "qwen3.8-flash"
