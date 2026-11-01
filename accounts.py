@@ -203,6 +203,8 @@ class AccountPool:
         self.dry_after_fails = max(1, int(dry_after_fails))
         self.total_budget = float(total_budget)
         self.state_path = Path(state_path) if state_path else None
+        # 轮换起点：每次取候选时把列表转一格，多账号均摊请求（否则永远打第一个）。
+        self._rr = 0
 
         # ★ 单 worker 假设：uvicorn 单进程多协程，临界区里没有 await，用 threading.Lock 就够
         #   （与 main.py 的 _USAGE_LOCK 同风格）。要开多 worker 得先换掉这里。
@@ -309,6 +311,10 @@ class AccountPool:
                 if not acct.supports(model):
                     continue
                 picked.append(acct)
+            if len(picked) > 1:
+                # 轮换：多账号均摊；请求内的失败切换仍按这个顺序往下走。
+                self._rr = (self._rr + 1) % len(picked)
+                picked = picked[self._rr:] + picked[:self._rr]
         return [a for a in picked if not self._unusable(a)]
 
     def fallback(self, model: str | None = None) -> AccountConfig | None:
