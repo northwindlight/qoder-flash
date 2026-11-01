@@ -238,7 +238,8 @@ class FailoverTest(FailoverFixture):
             self.open(pool, {"A": "hang", "B": "hang", "C": "hang"})
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 1.0, f"超了总预算：{elapsed:.2f}s")
-        self.assertEqual([x.account for x in ctx.exception.attempts], ["A", "B", "C"])
+        # 账号顺序按对话指纹粘性偏移（缓存友好），这里只要求三个都试过。
+        self.assertEqual(sorted(x.account for x in ctx.exception.attempts), ["A", "B", "C"])
         self.assertEqual(ctx.exception.attempts[-1].kind, "budget")
 
 

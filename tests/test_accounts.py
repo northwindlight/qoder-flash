@@ -61,7 +61,7 @@ class AccountConfigTest(unittest.TestCase):
 
     def test_model_list_follows_region_by_default(self):
         acct = AccountConfig(name="a", region="intl", config_dir="/tmp/x")
-        self.assertEqual(acct.model_list(), ["qwen3.8-flash", "qwen3.8-max"])
+        self.assertEqual(acct.model_list(), ["qwen3.8-flash", "qwen3.8-max", "deepseek-flash"])
 
     def test_model_list_explicit_wins(self):
         acct = AccountConfig(name="a", region="cn", config_dir="/tmp/x", models=["qwen3.8-flash"])

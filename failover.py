@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -94,6 +95,20 @@ def _no_candidate_reason(pool: AccountPool, model: str | None) -> str:
     return "没有可用账号 —— " + "；".join(f"{name}: {text}" for name, text in reasons.items())
 
 
+def _affinity(messages: list[dict[str, Any]]) -> int:
+    """对话指纹：只取最前面那点**稳定**内容（system + 首条消息的开头）。
+
+    不取全文——全文每回合都在长，指纹一变就换号，前缀缓存等于白存。
+    取开头是因为前缀缓存的命中边界本来就在这里：开头不变，后面接多少都还能命中。
+    """
+    digest = hashlib.sha256()
+    for message in messages[:2]:
+        content = message.get("content")
+        if isinstance(content, str):
+            digest.update(content[:1000].encode("utf-8", "replace"))
+    return int.from_bytes(digest.digest()[:8], "big")
+
+
 async def open_stream(
     pool: AccountPool,
     messages: list[dict[str, Any]],
@@ -107,7 +122,7 @@ async def open_stream(
     **返回之前首块已经到手**（prime 语义），全挂则抛 `AllAccountsFailed`。
     """
     attempts: list[Attempt] = []
-    candidates = pool.candidates(model)
+    candidates = pool.candidates(model, affinity=_affinity(messages))
     if not candidates:
         # 全在冷却：放一个探针，让上游一恢复就能自己被发现（而不是等人手动解冻）
         probe = pool.fallback(model)
